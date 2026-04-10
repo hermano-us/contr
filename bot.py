@@ -5,7 +5,7 @@ import time
 import os
 
 # ================= НАСТРОЙКИ =================
-TOKEN = os.environ.get("8772850572:AAHeQH6355pZyHilEbIljyrmJlgjrmwhH7s")
+TOKEN = os.environ.get("TOKEN")
 ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID")
 
 if not TOKEN:
