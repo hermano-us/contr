@@ -28,7 +28,7 @@ class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b'OK - Контрагент OSINT работает')
+        self.wfile.write(b'OK - Contragent OSINT is running')  # только ASCII
 
 def run_health_server():
     port = int(os.environ.get("PORT", 10000))
@@ -99,7 +99,7 @@ def format_report(data, report_type):
     if not data:
         return "❌ Данные не найдены или превышен лимит (100 запросов/сутки).\nПопробуй через 10 минут."
 
-    text = "✅ **Отчёт Контрагент OSINT v1.2-stable**\n\n"
+    text = "✅ **Отчёт Контрагент OSINT v1.2-stable-fix**\n\n"
     text += f"**Название:** {data.get('name') or data.get('full_name') or '—'}\n"
     text += f"**ИНН:** {data.get('inn', '—')}\n"
     text += f"**ОГРН:** {data.get('ogrn', '—')}\n"
@@ -134,7 +134,7 @@ def get_inline_keyboard(query):
 @bot.message_handler(commands=['start'])
 def start(message):
     bot.send_message(message.chat.id,
-        "👋 Привет! Я — Контрагент OSINT v1.2-stable\n\n"
+        "👋 Привет! Я — Контрагент OSINT v1.2-stable-fix\n\n"
         "Отправь **ИНН** или **ОГРН** — получишь подробный отчёт.\n\n"
         "Пример: `7707083893`",
         parse_mode="Markdown")
@@ -182,8 +182,6 @@ def callback_handler(call):
 
 # ================= ЗАПУСК =================
 if __name__ == "__main__":
-    # Запускаем health-сервер в отдельном потоке
     threading.Thread(target=run_health_server, daemon=True).start()
-    
-    print("🚀 Бот v1.2-stable запущен успешно!")
+    print("🚀 Бот v1.2-stable-fix запущен успешно!")
     bot.infinity_polling()
