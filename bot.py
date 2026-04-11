@@ -6,6 +6,8 @@ import os
 import json
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 # ================= НАСТРОЙКИ =================
 TOKEN = os.environ.get("TOKEN")
@@ -21,7 +23,20 @@ if ADMIN_CHAT_ID:
 
 bot = telebot.TeleBot(TOKEN)
 
-# Инициализация Google Sheets
+# ================= HEALTH-СЕРВЕР ДЛЯ RENDER =================
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b'OK - Контрагент OSINT работает')
+
+def run_health_server():
+    port = int(os.environ.get("PORT", 10000))
+    server = HTTPServer(('0.0.0.0', port), HealthHandler)
+    print(f"🚀 Health server запущен на порту {port}")
+    server.serve_forever()
+
+# ================= GOOGLE SHEETS =================
 gc = None
 if GOOGLE_CREDENTIALS and SHEET_ID:
     try:
@@ -44,15 +59,16 @@ def log_to_sheet(user_id, query, status, report_type):
         worksheet = sh.sheet1
         row = [
             datetime.now().strftime("%d.%m.%Y %H:%M:%S"),
-            user_id,
+            str(user_id),
             query,
             status,
             report_type,
             datetime.now().strftime("%H:%M:%S")
         ]
         worksheet.append_row(row)
-    except:
-        pass
+        print(f"📊 Запись в Sheets: {query} → {status}")
+    except Exception as e:
+        print(f"❌ Ошибка записи в Sheets: {e}")
 
 def send_log_to_admin(user_id, query, status, details=""):
     if not ADMIN_CHAT_ID:
@@ -83,7 +99,7 @@ def format_report(data, report_type):
     if not data:
         return "❌ Данные не найдены или превышен лимит (100 запросов/сутки).\nПопробуй через 10 минут."
 
-    text = "✅ **Отчёт Контрагент OSINT v1.2**\n\n"
+    text = "✅ **Отчёт Контрагент OSINT v1.2-stable**\n\n"
     text += f"**Название:** {data.get('name') or data.get('full_name') or '—'}\n"
     text += f"**ИНН:** {data.get('inn', '—')}\n"
     text += f"**ОГРН:** {data.get('ogrn', '—')}\n"
@@ -96,15 +112,13 @@ def format_report(data, report_type):
             text += f"**Руководитель:** {head.get('name', '—')} ({head.get('position', '—')})\n"
         if data.get("address"):
             text += f"**Юр. адрес:** {data['address']}\n"
-            if "mass" in str(data.get("address", "")).lower():
-                text += "⚠️ **Признак массового адреса!**\n"
         if data.get("okved"):
             text += f"**Основной ОКВЭД:** {data['okved']}\n"
         history = data.get("history", [])
         text += f"**Изменений в реестре:** {len(history)} записей\n"
 
     text += f"\n📅 Отчёт от {datetime.now().strftime('%d.%m.%Y %H:%M')}\n"
-    text += "Источник: открытые данные ФНС (egrul.org) — 100% легально"
+    text += "Источник: открытые данные ФНС (egrul.org)"
     return text
 
 def get_inline_keyboard(query):
@@ -120,8 +134,8 @@ def get_inline_keyboard(query):
 @bot.message_handler(commands=['start'])
 def start(message):
     bot.send_message(message.chat.id,
-        "👋 Привет! Я — Контрагент OSINT v1.2\n\n"
-        "Отправь **ИНН** или **ОГРН** — получишь подробный отчёт из ЕГРЮЛ/ЕГРИП.\n\n"
+        "👋 Привет! Я — Контрагент OSINT v1.2-stable\n\n"
+        "Отправь **ИНН** или **ОГРН** — получишь подробный отчёт.\n\n"
         "Пример: `7707083893`",
         parse_mode="Markdown")
 
@@ -160,17 +174,16 @@ def callback_handler(call):
         report = format_report(data, report_type)
         bot.edit_message_text(report, call.message.chat.id, call.message.message_id,
                               parse_mode="Markdown", reply_markup=get_inline_keyboard(query))
-
     elif call.data == "buy_subscription":
         bot.answer_callback_query(call.id)
-        bot.send_message(call.message.chat.id,
-            "💰 **Подписка Контрагент OSINT**\n\n"
-            "Неограниченные запросы + мониторинг изменений — 4 900 ₽/месяц\n\n"
-            "Напиши @твой_логин для оплаты (СБП / ЮKassa)",
-            parse_mode="Markdown")
-
+        bot.send_message(call.message.chat.id, "💰 Подписка 4900 ₽/мес — скоро запустим оплату", parse_mode="Markdown")
     elif call.data.startswith("monitor_"):
-        bot.answer_callback_query(call.id, "Мониторинг в разработке (v1.3)")
+        bot.answer_callback_query(call.id, "Мониторинг в v1.3")
 
-print("🚀 Бот v1.2 запущен успешно!")
-bot.infinity_polling()
+# ================= ЗАПУСК =================
+if __name__ == "__main__":
+    # Запускаем health-сервер в отдельном потоке
+    threading.Thread(target=run_health_server, daemon=True).start()
+    
+    print("🚀 Бот v1.2-stable запущен успешно!")
+    bot.infinity_polling()
