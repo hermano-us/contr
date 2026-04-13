@@ -14,34 +14,35 @@ TOKEN = os.environ.get("TOKEN")
 ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID")
 GOOGLE_CREDENTIALS = os.environ.get("GOOGLE_CREDENTIALS")
 SHEET_ID = os.environ.get("SHEET_ID")
-WEBHOOK_URL = os.environ.get("WEBHOOK_URL")   # ← добавим ниже
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL")
 
-if not TOKEN:
-    raise ValueError("TOKEN не задан!")
+if not TOKEN or not WEBHOOK_URL:
+    raise ValueError("TOKEN или WEBHOOK_URL не заданы!")
 
 if ADMIN_CHAT_ID:
     ADMIN_CHAT_ID = int(ADMIN_CHAT_ID)
 
-bot = telebot.TeleBot(TOKEN, threaded=False)   # важно для Render
+bot = telebot.TeleBot(TOKEN, threaded=False)
 
-# ================= HEALTH + WEBHOOK СЕРВЕР =================
+# ================= WEBHOOK + HEALTH СЕРВЕР =================
 class WebhookHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b'OK - Contragent OSINT webhook mode')
+        self.wfile.write(b'OK - Contragent OSINT webhook')
 
     def do_POST(self):
         if self.path == "/webhook":
             self.send_response(200)
             self.end_headers()
-            content_length = int(self.headers['Content-Length'])
-            update_str = self.rfile.read(content_length).decode('utf-8')
-            try:
-                update = telebot.types.Update.de_json(update_str)
-                bot.process_new_updates([update])
-            except Exception as e:
-                print(f"Webhook error: {e}")
+            content_length = int(self.headers.get('Content-Length', 0))
+            if content_length > 0:
+                update_str = self.rfile.read(content_length).decode('utf-8')
+                try:
+                    update = telebot.types.Update.de_json(update_str)
+                    bot.process_new_updates([update])
+                except Exception as e:
+                    print(f"Webhook error: {e}")
         else:
             self.send_response(404)
             self.end_headers()
@@ -112,7 +113,7 @@ def get_egrul_data(query):
 def format_report(data, report_type):
     if not data:
         return "❌ Данные не найдены или превышен лимит."
-    text = "✅ **Отчёт Контрагент OSINT v1.3-webhook**\n\n"
+    text = "✅ **Отчёт Контрагент OSINT v1.3-webhook-fix**\n\n"
     text += f"**Название:** {data.get('name') or data.get('full_name') or '—'}\n"
     text += f"**ИНН:** {data.get('inn', '—')}\n"
     text += f"**ОГРН:** {data.get('ogrn', '—')}\n"
@@ -129,7 +130,7 @@ def format_report(data, report_type):
         history = data.get("history", [])
         text += f"**Изменений в реестре:** {len(history)} записей\n"
     text += f"\n📅 Отчёт от {datetime.now().strftime('%d.%m.%Y %H:%M')}\n"
-    text += "Источник: открытые данные ФНС"
+    text += "Источник: открытые данные ФНС (egrul.org)"
     return text
 
 def get_inline_keyboard(query):
@@ -170,15 +171,17 @@ def handle_query(message):
 
 # ================= ЗАПУСК =================
 if __name__ == "__main__":
-    # Запускаем сервер
+    # Запускаем webhook-сервер в отдельном потоке
     threading.Thread(target=run_server, daemon=True).start()
 
     # Устанавливаем webhook
-    if WEBHOOK_URL:
-        bot.remove_webhook()
-        bot.set_webhook(url=WEBHOOK_URL)
-        print(f"✅ Webhook установлен на {WEBHOOK_URL}")
-    else:
-        print("⚠️ WEBHOOK_URL не задан в Environment!")
+    bot.remove_webhook()
+    bot.set_webhook(url=WEBHOOK_URL)
+    print(f"✅ Webhook установлен на {WEBHOOK_URL}")
 
-    print("🚀 Бот v1.3-webhook запущен успешно!")
+    print("🚀 Бот v1.3-webhook-fix запущен успешно!")
+
+    # Keep-alive для Render (чтобы процесс не завершался)
+    print("🔄 Keep-alive loop запущен")
+    while True:
+        time.sleep(60)   # каждые 60 секунд просто "живём"
