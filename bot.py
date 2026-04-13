@@ -1,6 +1,6 @@
 import telebot
 import requests
-from datetime import datetime
+from datetime import datetime, date
 import time
 import os
 import json
@@ -29,7 +29,7 @@ class WebhookHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b'OK - Contragent OSINT v1.5')
+        self.wfile.write(b'OK - Contragent OSINT v1.6')
 
     def do_POST(self):
         if self.path == "/webhook":
@@ -50,7 +50,7 @@ class WebhookHandler(BaseHTTPRequestHandler):
 def run_server():
     port = int(os.environ.get("PORT", 10000))
     server = HTTPServer(('0.0.0.0', port), WebhookHandler)
-    print(f"🚀 Webhook-сервер v1.5 запущен на порту {port}")
+    print(f"🚀 Webhook-сервер v1.6 запущен на порту {port}")
     server.serve_forever()
 
 # ================= GOOGLE SHEETS =================
@@ -92,6 +92,26 @@ def send_log_to_admin(user_id, query, status, details=""):
     except:
         pass
 
+# ================= СТАТИСТИКА =================
+def get_stats():
+    if not gc or not SHEET_ID:
+        return "Статистика недоступна"
+    try:
+        sh = gc.open_by_key(SHEET_ID)
+        worksheet = sh.sheet1
+        all_rows = worksheet.get_all_values()
+        total = len(all_rows) - 1 if len(all_rows) > 0 else 0
+        
+        today = date.today().strftime("%d.%m.%Y")
+        today_count = sum(1 for row in all_rows[1:] if row and row[0].startswith(today))
+        
+        return f"📊 Статистика бота v1.6\n\n" \
+               f"Всего запросов: {total}\n" \
+               f"Сегодня: {today_count}\n" \
+               f"Активных пользователей: пока считаем"
+    except:
+        return "Ошибка получения статистики"
+
 # ================= ОСНОВНЫЕ ФУНКЦИИ =================
 def get_egrul_data(query):
     base_url = "https://egrul.org"
@@ -113,7 +133,7 @@ def format_report(data, report_type):
     if not data:
         return "❌ Данные не найдены."
 
-    text = "✅ **Отчёт Контрагент OSINT v1.5**\n\n"
+    text = "✅ **Отчёт Контрагент OSINT v1.6**\n\n"
     text += f"**Название:** {data.get('name') or data.get('full_name') or '—'}\n"
     text += f"**ИНН:** {data.get('inn', '—')}\n"
     text += f"**ОГРН:** {data.get('ogrn', '—')}\n"
@@ -132,8 +152,11 @@ def format_report(data, report_type):
         text += f"**Изменений в реестре:** {len(history)} записей\n"
 
         # Признаки рисков
-        if "mass" in str(data.get("address", "")).lower():
+        address = str(data.get("address", "")).lower()
+        if "mass" in address or "масс" in address:
             text += "⚠️ **Признак массового адреса!**\n"
+        if "ликвидац" in str(data.get("status", "")).lower():
+            text += "⚠️ **Компания в процессе ликвидации!**\n"
 
     text += f"\n📅 Отчёт от {datetime.now().strftime('%d.%m.%Y %H:%M')}\n"
     text += "Источник: открытые данные ФНС (egrul.org)"
@@ -152,8 +175,9 @@ def get_inline_keyboard(query):
 @bot.message_handler(commands=['start'])
 def start(message):
     bot.send_message(message.chat.id,
-        "👋 Привет! Я — Контрагент OSINT v1.5\n\n"
-        "Отправь **ИНН** или **ОГРН** — получишь подробный отчёт с признаками рисков.",
+        "👋 Привет! Я — Контрагент OSINT v1.6\n\n"
+        "Отправь **ИНН** или **ОГРН** — получишь отчёт с признаками рисков.\n"
+        "Админ-команда: /stats",
         parse_mode="Markdown")
 
 @bot.message_handler(commands=['stats'])
@@ -161,7 +185,8 @@ def stats(message):
     if str(message.chat.id) != str(ADMIN_CHAT_ID):
         bot.reply_to(message, "❌ Команда доступна только администратору.")
         return
-    bot.reply_to(message, "📊 Статистика пока в разработке (v1.6). Скоро будет полная аналитика.")
+    stat_text = get_stats()
+    bot.reply_to(message, stat_text, parse_mode="Markdown")
 
 @bot.message_handler(content_types=['text'])
 def handle_query(message):
@@ -191,7 +216,7 @@ if __name__ == "__main__":
     bot.set_webhook(url=WEBHOOK_URL)
     print(f"✅ Webhook установлен на {WEBHOOK_URL}")
 
-    print("🚀 Бот v1.5 запущен успешно!")
+    print("🚀 Бот v1.6 запущен успешно!")
     print("🔄 Keep-alive loop запущен")
 
     while True:
