@@ -29,7 +29,7 @@ class WebhookHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b'OK - Contragent OSINT v1.4')
+        self.wfile.write(b'OK - Contragent OSINT v1.5')
 
     def do_POST(self):
         if self.path == "/webhook":
@@ -50,7 +50,7 @@ class WebhookHandler(BaseHTTPRequestHandler):
 def run_server():
     port = int(os.environ.get("PORT", 10000))
     server = HTTPServer(('0.0.0.0', port), WebhookHandler)
-    print(f"🚀 Webhook-сервер v1.4 запущен на порту {port}")
+    print(f"🚀 Webhook-сервер v1.5 запущен на порту {port}")
     server.serve_forever()
 
 # ================= GOOGLE SHEETS =================
@@ -113,7 +113,7 @@ def format_report(data, report_type):
     if not data:
         return "❌ Данные не найдены."
 
-    text = "✅ **Отчёт Контрагент OSINT v1.4**\n\n"
+    text = "✅ **Отчёт Контрагент OSINT v1.5**\n\n"
     text += f"**Название:** {data.get('name') or data.get('full_name') or '—'}\n"
     text += f"**ИНН:** {data.get('inn', '—')}\n"
     text += f"**ОГРН:** {data.get('ogrn', '—')}\n"
@@ -130,6 +130,10 @@ def format_report(data, report_type):
             text += f"**Основной ОКВЭД:** {data['okved']}\n"
         history = data.get("history", [])
         text += f"**Изменений в реестре:** {len(history)} записей\n"
+
+        # Признаки рисков
+        if "mass" in str(data.get("address", "")).lower():
+            text += "⚠️ **Признак массового адреса!**\n"
 
     text += f"\n📅 Отчёт от {datetime.now().strftime('%d.%m.%Y %H:%M')}\n"
     text += "Источник: открытые данные ФНС (egrul.org)"
@@ -148,8 +152,8 @@ def get_inline_keyboard(query):
 @bot.message_handler(commands=['start'])
 def start(message):
     bot.send_message(message.chat.id,
-        "👋 Привет! Я — Контрагент OSINT v1.4\n\n"
-        "Отправь **ИНН** или **ОГРН** — получишь подробный отчёт.",
+        "👋 Привет! Я — Контрагент OSINT v1.5\n\n"
+        "Отправь **ИНН** или **ОГРН** — получишь подробный отчёт с признаками рисков.",
         parse_mode="Markdown")
 
 @bot.message_handler(commands=['stats'])
@@ -157,7 +161,7 @@ def stats(message):
     if str(message.chat.id) != str(ADMIN_CHAT_ID):
         bot.reply_to(message, "❌ Команда доступна только администратору.")
         return
-    bot.reply_to(message, "📊 Статистика пока в разработке (v1.5).")
+    bot.reply_to(message, "📊 Статистика пока в разработке (v1.6). Скоро будет полная аналитика.")
 
 @bot.message_handler(content_types=['text'])
 def handle_query(message):
@@ -187,7 +191,7 @@ if __name__ == "__main__":
     bot.set_webhook(url=WEBHOOK_URL)
     print(f"✅ Webhook установлен на {WEBHOOK_URL}")
 
-    print("🚀 Бот v1.4 запущен успешно!")
+    print("🚀 Бот v1.5 запущен успешно!")
     print("🔄 Keep-alive loop запущен")
 
     while True:
