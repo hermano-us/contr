@@ -24,12 +24,12 @@ if ADMIN_CHAT_ID:
 
 bot = telebot.TeleBot(TOKEN, threaded=False)
 
-# ================= WEBHOOK + HEALTH СЕРВЕР =================
+# ================= WEBHOOK СЕРВЕР =================
 class WebhookHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b'OK - Contragent OSINT webhook')
+        self.wfile.write(b'OK - Contragent OSINT v1.4')
 
     def do_POST(self):
         if self.path == "/webhook":
@@ -50,7 +50,7 @@ class WebhookHandler(BaseHTTPRequestHandler):
 def run_server():
     port = int(os.environ.get("PORT", 10000))
     server = HTTPServer(('0.0.0.0', port), WebhookHandler)
-    print(f"🚀 Webhook-сервер запущен на порту {port}")
+    print(f"🚀 Webhook-сервер v1.4 запущен на порту {port}")
     server.serve_forever()
 
 # ================= GOOGLE SHEETS =================
@@ -88,8 +88,7 @@ def send_log_to_admin(user_id, query, status, details=""):
     if not ADMIN_CHAT_ID:
         return
     try:
-        log_text = f"📌 ЛОГ\nПользователь: {user_id}\nЗапрос: {query}\nСтатус: {status}\n{details}\nВремя: {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}"
-        bot.send_message(ADMIN_CHAT_ID, log_text)
+        bot.send_message(ADMIN_CHAT_ID, f"📌 ЛОГ\nПользователь: {user_id}\nЗапрос: {query}\nСтатус: {status}\n{details}")
     except:
         pass
 
@@ -112,13 +111,15 @@ def get_egrul_data(query):
 
 def format_report(data, report_type):
     if not data:
-        return "❌ Данные не найдены или превышен лимит."
-    text = "✅ **Отчёт Контрагент OSINT v1.3-webhook-fix**\n\n"
+        return "❌ Данные не найдены."
+
+    text = "✅ **Отчёт Контрагент OSINT v1.4**\n\n"
     text += f"**Название:** {data.get('name') or data.get('full_name') or '—'}\n"
     text += f"**ИНН:** {data.get('inn', '—')}\n"
     text += f"**ОГРН:** {data.get('ogrn', '—')}\n"
     text += f"**Статус:** {data.get('status', '—')}\n"
     text += f"**Дата регистрации:** {data.get('reg_date', '—')}\n"
+
     if report_type == "full":
         if data.get("head"):
             head = data["head"]
@@ -129,6 +130,7 @@ def format_report(data, report_type):
             text += f"**Основной ОКВЭД:** {data['okved']}\n"
         history = data.get("history", [])
         text += f"**Изменений в реестре:** {len(history)} записей\n"
+
     text += f"\n📅 Отчёт от {datetime.now().strftime('%d.%m.%Y %H:%M')}\n"
     text += "Источник: открытые данные ФНС (egrul.org)"
     return text
@@ -146,8 +148,16 @@ def get_inline_keyboard(query):
 @bot.message_handler(commands=['start'])
 def start(message):
     bot.send_message(message.chat.id,
-        "👋 Привет! Я — Контрагент OSINT (webhook)\n\nОтправь ИНН или ОГРН.",
+        "👋 Привет! Я — Контрагент OSINT v1.4\n\n"
+        "Отправь **ИНН** или **ОГРН** — получишь подробный отчёт.",
         parse_mode="Markdown")
+
+@bot.message_handler(commands=['stats'])
+def stats(message):
+    if str(message.chat.id) != str(ADMIN_CHAT_ID):
+        bot.reply_to(message, "❌ Команда доступна только администратору.")
+        return
+    bot.reply_to(message, "📊 Статистика пока в разработке (v1.5).")
 
 @bot.message_handler(content_types=['text'])
 def handle_query(message):
@@ -155,7 +165,7 @@ def handle_query(message):
     user_id = message.chat.id
 
     if not text.isdigit() or len(text) < 9 or len(text) > 15:
-        bot.reply_to(message, "❗️ Отправь только цифры ИНН/ОГРН")
+        bot.reply_to(message, "❗️ Отправь только цифры ИНН или ОГРН")
         return
 
     bot.send_chat_action(message.chat.id, 'typing')
@@ -171,17 +181,14 @@ def handle_query(message):
 
 # ================= ЗАПУСК =================
 if __name__ == "__main__":
-    # Запускаем webhook-сервер в отдельном потоке
     threading.Thread(target=run_server, daemon=True).start()
 
-    # Устанавливаем webhook
     bot.remove_webhook()
     bot.set_webhook(url=WEBHOOK_URL)
     print(f"✅ Webhook установлен на {WEBHOOK_URL}")
 
-    print("🚀 Бот v1.3-webhook-fix запущен успешно!")
-
-    # Keep-alive для Render (чтобы процесс не завершался)
+    print("🚀 Бот v1.4 запущен успешно!")
     print("🔄 Keep-alive loop запущен")
+
     while True:
-        time.sleep(60)   # каждые 60 секунд просто "живём"
+        time.sleep(60)
