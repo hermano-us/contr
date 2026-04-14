@@ -8,6 +8,7 @@ from io import BytesIO
 import aiohttp
 import aiosqlite
 import gspread
+import pandas as pd   # для экспорта в Excel
 from oauth2client.service_account import ServiceAccountCredentials
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, BufferedInputFile, Update
@@ -19,6 +20,7 @@ from reportlab.pdfgen import canvas
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.lib import colors
+from reportlab.platypus import Table, TableStyle
 # ================= CONFIG =================
 TOKEN = os.environ.get("TOKEN")
 ADMIN_CHAT_ID = int(os.environ.get("ADMIN_CHAT_ID", 0))
@@ -34,9 +36,9 @@ logger = logging.getLogger(__name__)
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 if CHECKO_API_KEY:
-    logger.info("✅ Checko API подключён — полный профиль компании")
+    logger.info("✅ Checko API подключён — полный профиль + поиск по названию")
 else:
-    logger.warning("⚠️ CHECKO_API_KEY не задан — используется только ЕГРЮЛ")
+    logger.warning("⚠️ CHECKO_API_KEY не задан — поиск по названию недоступен")
 # ================= FONT =================
 FONT_NAME = "DejaVuSans"
 FONT_PATH = "DejaVuSans.ttf"
@@ -49,7 +51,6 @@ else:
 # ================= DATABASE =================
 async def init_db():
     async with aiosqlite.connect(DB_NAME) as db:
-        # Основная таблица логов (с миграцией)
         await db.execute('''CREATE TABLE IF NOT EXISTS usage_log 
                             (user_id INTEGER, query_date DATE DEFAULT CURRENT_DATE)''')
         try:
@@ -64,7 +65,6 @@ async def init_db():
         await db.execute('''CREATE TABLE IF NOT EXISTS subscriptions 
                             (user_id INTEGER PRIMARY KEY, until_date DATE)''')
 
-        # Кэш (TTL 1 час)
         await db.execute('''CREATE TABLE IF NOT EXISTS cache (
                             inn TEXT PRIMARY KEY,
                             data TEXT,
@@ -234,6 +234,24 @@ async def get_arbitration_data(inn: str) -> dict | None:
         logger.error(f"Arbitration error: {e}")
         return None
 
+# === НОВОЕ: Поиск по названию компании ===
+async def search_by_name(query: str) -> list[dict] | None:
+    if not CHECKO_API_KEY:
+        return None
+    try:
+        async with aiohttp.ClientSession() as session:
+            url = "https://api.checko.ru/v2/search"
+            params = {"key": CHECKO_API_KEY, "query": query.strip(), "limit": 10}
+            async with session.get(url, params=params, timeout=10) as resp:
+                if resp.status != 200:
+                    return None
+                data = await resp.json()
+                # Возвращаем список результатов (Checko возвращает массив в "data")
+                return data.get("data", []) if isinstance(data.get("data"), list) else None
+    except Exception as e:
+        logger.error(f"Search by name error: {e}")
+        return None
+
 # ================= HELPERS =================
 def get_formatted_address(data: dict) -> str:
     if isinstance(data.get("ЮрАдрес"), dict):
@@ -326,7 +344,7 @@ def safe_get_founders_count(data: dict) -> int:
     org = len(uch.get("РосОрг", [])) if isinstance(uch.get("РосОрг"), list) else 0
     return fl + org
 
-# ================= PDF v2.8 =================
+# ================= PDF v2.8 (ТАБЛИЦЫ + улучшения) =================
 def draw_multiline(c, x, y, text, font_size=10, max_width=480, line_height=14):
     if not text:
         return y
@@ -389,43 +407,55 @@ def create_pro_pdf(data: dict, score: int, risks: list, warnings: list, color: c
     c.drawString(220, y, f"{status_emoji} {status_text}")
     y -= 45
 
-    # КЛЮЧЕВЫЕ ФАКТЫ
+    # КЛЮЧЕВЫЕ ФАКТЫ — ТАБЛИЦА
     c.setFont(FONT_NAME, 13)
     c.setFillColor(colors.black)
     c.drawString(50, y, "Ключевые факты")
-    y -= 25
+    y -= 30
 
     is_ip_flag = is_individual_entrepreneur(data)
     director = safe_get_director(data)
     branches = safe_get_branches(data)
 
     if is_ip_flag:
-        fields = [
-            ("ИНН", data.get('ИНН', '—')),
-            ("ОГРНИП", data.get('ОГРНИП', data.get('ОГРН', '—'))),
-            ("ФИО предпринимателя", director),
-            ("Дата регистрации", calculate_age(data.get('ДатаРег', ''))),
-            ("Адрес", get_formatted_address(data)),
+        table_data = [
+            ["Параметр", "Значение"],
+            ["ИНН", data.get('ИНН', '—')],
+            ["ОГРНИП", data.get('ОГРНИП', data.get('ОГРН', '—'))],
+            ["ФИО предпринимателя", director],
+            ["Дата регистрации", calculate_age(data.get('ДатаРег', ''))],
+            ["Адрес", get_formatted_address(data)],
         ]
     else:
-        fields = [
-            ("ИНН", data.get('ИНН', '—')),
-            ("ОГРН", data.get('ОГРН', '—')),
-            ("КПП", data.get('КПП', '—')),
-            ("Руководитель", director),
-            ("Дата регистрации", calculate_age(data.get('ДатаРег', ''))),
-            ("Адрес", get_formatted_address(data)),
-            ("Уставный капитал", data.get('УставКапитал', '—')),
-            ("Филиалы", f"{branches} шт." if branches else "—"),
+        table_data = [
+            ["Параметр", "Значение"],
+            ["ИНН", data.get('ИНН', '—')],
+            ["ОГРН", data.get('ОГРН', '—')],
+            ["КПП", data.get('КПП', '—')],
+            ["Руководитель", director],
+            ["Дата регистрации", calculate_age(data.get('ДатаРег', ''))],
+            ["Адрес", get_formatted_address(data)],
+            ["Уставный капитал", data.get('УставКапитал', '—')],
+            ["Филиалы", f"{branches} шт." if branches else "—"],
         ]
 
-    c.setFont(FONT_NAME, 10)
-    c.setFillColor(colors.grey)
-    for label, value in fields:
-        c.drawString(50, y, f"{label}:")
-        y = draw_multiline(c, 210, y, str(value), max_width=340)
-        y -= 8
-    y -= 25
+    table = Table(table_data, colWidths=[150, 320])
+    table.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor("#1a237e")),
+        ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
+        ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+        ('FONTNAME', (0, 0), (-1, 0), FONT_NAME),
+        ('FONTSIZE', (0, 0), (-1, 0), 11),
+        ('BOTTOMPADDING', (0, 0), (-1, 0), 8),
+        ('BACKGROUND', (0, 1), (-1, -1), colors.white),
+        ('GRID', (0, 0), (-1, -1), 1, colors.lightgrey),
+        ('FONTNAME', (0, 1), (-1, -1), FONT_NAME),
+        ('FONTSIZE', (0, 1), (-1, -1), 10),
+        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+    ]))
+    table.wrapOn(c, 50, y)
+    table.drawOn(c, 50, y - table._height)
+    y -= table._height + 25
 
     # КОНТАКТЫ
     contacts = data.get("Контакты") or []
@@ -449,31 +479,48 @@ def create_pro_pdf(data: dict, score: int, risks: list, warnings: list, color: c
             y -= 5
         y -= 15
 
-    # УЧРЕДИТЕЛИ
+    # УЧРЕДИТЕЛИ — теперь тоже в таблице
     uchred = data.get("Учред", {})
-    if uchred:
+    if uchred and uchred.get("ФЛ"):
         c.setFont(FONT_NAME, 13)
         c.setFillColor(colors.black)
         c.drawString(50, y, "👥 Учредители")
-        y -= 22
-        c.setFont(FONT_NAME, 9)
+        y -= 25
+        founders_table = [["ФИО", "Доля %"]]
         for fl in uchred.get("ФЛ", [])[:6]:
-            y = draw_multiline(c, 60, y, f"• {fl.get('ФИО', '—')} — {fl.get('Доля', '—')}%", max_width=480)
-            y -= 4
-        y -= 15
+            founders_table.append([fl.get('ФИО', '—'), f"{fl.get('Доля', '—')}%"])
+        ft = Table(founders_table, colWidths=[280, 140])
+        ft.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor("#1a237e")),
+            ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
+            ('GRID', (0, 0), (-1, -1), 1, colors.lightgrey),
+            ('FONTNAME', (0, 0), (-1, -1), FONT_NAME),
+            ('FONTSIZE', (0, 0), (-1, -1), 9),
+        ]))
+        ft.wrapOn(c, 50, y)
+        ft.drawOn(c, 50, y - ft._height)
+        y -= ft._height + 20
 
-    # РИСКИ
-    if mass_flags or warnings:
+    # РИСКИ — таблица
+    if mass_flags or warnings or risks:
         c.setFont(FONT_NAME, 13)
         c.setFillColor(colors.orange)
-        c.drawString(50, y, "⚠️ Сведения ЕГРЮЛ о рисках")
-        y -= 22
-        c.setFont(FONT_NAME, 10)
-        c.setFillColor(colors.black)
-        for w in warnings + mass_flags:
-            y = draw_multiline(c, 60, y, f"• {w}", max_width=480)
-            y -= 6
-        y -= 15
+        c.drawString(50, y, "⚠️ Риски и предупреждения")
+        y -= 25
+        risk_table = [["Тип", "Описание"]]
+        for item in warnings + mass_flags + risks:
+            risk_table.append(["⚠️", item])
+        rt = Table(risk_table, colWidths=[60, 400])
+        rt.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor("#ff9800")),
+            ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
+            ('GRID', (0, 0), (-1, -1), 1, colors.lightgrey),
+            ('FONTNAME', (0, 0), (-1, -1), FONT_NAME),
+            ('FONTSIZE', (0, 0), (-1, -1), 9),
+        ]))
+        rt.wrapOn(c, 50, y)
+        rt.drawOn(c, 50, y - rt._height)
+        y -= rt._height + 20
 
     # АРБИТРАЖ
     if arbitration_data and isinstance(arbitration_data, dict):
@@ -485,17 +532,6 @@ def create_pro_pdf(data: dict, score: int, risks: list, warnings: list, color: c
             y -= 30
 
     # ЗАКЛЮЧЕНИЕ
-    c.setFont(FONT_NAME, 13)
-    c.setFillColor(colors.black)
-    c.drawString(50, y, "Экспертное заключение и риски")
-    y -= 22
-    c.setFont(FONT_NAME, 10)
-    c.setFillColor(colors.black)
-    for risk in risks:
-        y = draw_multiline(c, 60, y, f"• {risk}", max_width=480)
-        y -= 6
-    y -= 20
-
     c.setFont(FONT_NAME, 14)
     c.setFillColor(color)
     c.drawString(50, y, "РЕКОМЕНДАЦИЯ OSINT PRO")
@@ -544,52 +580,220 @@ def log_to_sheet(user_id, inn, score: int):
     except Exception as e:
         logger.error(f"Sheet write error: {e}")
 
+# ================= NEW: EXPORT TO EXCEL =================
+async def export_stats_to_excel() -> BytesIO:
+    async with aiosqlite.connect(DB_NAME) as db:
+        # usage_log
+        async with db.execute("SELECT * FROM usage_log ORDER BY query_date DESC") as cur:
+            usage_rows = await cur.fetchall()
+        usage_df = pd.DataFrame(usage_rows, columns=["user_id", "query_date", "inn", "score"])
+        
+        # subscriptions
+        async with db.execute("SELECT * FROM subscriptions") as cur:
+            sub_rows = await cur.fetchall()
+        sub_df = pd.DataFrame(sub_rows, columns=["user_id", "until_date"])
+    
+    buffer = BytesIO()
+    with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
+        usage_df.to_excel(writer, sheet_name="Запросы", index=False)
+        sub_df.to_excel(writer, sheet_name="Подписки", index=False)
+    buffer.seek(0)
+    return buffer
+
 # ================= HANDLERS =================
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
     is_admin = message.from_user.id == ADMIN_CHAT_ID
-    text = "🚀 **OSINT PRO v2.8**\n\nПолный анализ компаний и ИП из Checko.ru + ЕГРЮЛ\n✅ Кэширование • История • Обновление данных\n\nПришлите ИНН или ОГРН"
+    text = "🚀 **OSINT PRO v2.8**\n\nТеперь можно искать **по названию компании**!\n✅ Кэш • Таблицы в PDF • Экспорт статистики\n\nПришлите **ИНН / ОГРН** или **название компании**"
     if is_admin:
-        text += "\n\n👑 **Админ-панель:**\n/grant <user_id> <дней>\n/revoke <user_id>\n/stats\n/pricing"
+        text += "\n\n👑 **Админ-панель:** /admin"
     await message.answer(text, parse_mode=ParseMode.MARKDOWN)
 
-@dp.message(Command("grant"))
-async def cmd_grant(message: Message):
+@dp.message(Command("admin"))
+async def cmd_admin(message: Message):
     if message.from_user.id != ADMIN_CHAT_ID:
         return await message.answer("⛔️ Доступ запрещён.")
-    try:
-        _, user_id_str, days_str = message.text.split()
-        user_id = int(user_id_str)
-        days = int(days_str)
-        await grant_subscription(user_id, days)
-        await message.answer(f"✅ Подписка выдана пользователю {user_id} на {days} дней")
-    except:
-        await message.answer("❌ Формат: /grant <user_id> <дней>")
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📊 Статистика", callback_data="admin_stats")],
+        [InlineKeyboardButton(text="📤 Экспорт в Excel", callback_data="admin_export")],
+        [InlineKeyboardButton(text="💰 Цена подписки", callback_data="admin_pricing")],
+        [InlineKeyboardButton(text="🔑 Выдать подписку", callback_data="admin_grant")],
+        [InlineKeyboardButton(text="🚫 Отозвать подписку", callback_data="admin_revoke")],
+    ])
+    await message.answer("👑 **Админ-панель OSINT PRO**", reply_markup=kb)
 
-@dp.message(Command("revoke"))
-async def cmd_revoke(message: Message):
-    if message.from_user.id != ADMIN_CHAT_ID:
-        return await message.answer("⛔️ Доступ запрещён.")
-    try:
-        _, user_id_str = message.text.split()
-        user_id = int(user_id_str)
-        await revoke_subscription(user_id)
-        await message.answer(f"✅ Подписка отозвана у пользователя {user_id}")
-    except:
-        await message.answer("❌ Формат: /revoke <user_id>")
-
-@dp.message(Command("stats"))
-async def cmd_stats(message: Message):
-    if message.from_user.id != ADMIN_CHAT_ID:
-        return await message.answer("⛔️ Доступ запрещён.")
+@dp.callback_query(F.data == "admin_stats")
+async def admin_stats(call: CallbackQuery):
+    if call.from_user.id != ADMIN_CHAT_ID: return await call.answer("⛔️ Доступ запрещён.")
+    await call.answer()
     stats_text = await get_stats()
-    await message.answer(stats_text, parse_mode=ParseMode.MARKDOWN)
+    await call.message.edit_text(stats_text, parse_mode=ParseMode.MARKDOWN)
 
-@dp.message(Command("pricing"))
-async def cmd_pricing(message: Message):
-    if message.from_user.id != ADMIN_CHAT_ID:
-        return await message.answer("⛔️ Доступ запрещён.")
-    await message.answer(f"💰 **Текущая цена подписки**\n\n{SUBSCRIPTION_PRICE}\n\nБезлимит + премиум-PDF")
+@dp.callback_query(F.data == "admin_export")
+async def admin_export(call: CallbackQuery):
+    if call.from_user.id != ADMIN_CHAT_ID: return await call.answer("⛔️ Доступ запрещён.")
+    await call.answer("📤 Генерирую Excel...")
+    try:
+        excel_buffer = await export_stats_to_excel()
+        await call.message.answer_document(
+            BufferedInputFile(excel_buffer.read(), filename=f"OSINT_PRO_статистика_{datetime.now().strftime('%Y-%m-%d')}.xlsx"),
+            caption="✅ Полная статистика запросов и подписок"
+        )
+    except Exception as e:
+        logger.error(f"Export error: {e}")
+        await call.message.answer("❌ Ошибка генерации Excel")
+
+@dp.callback_query(F.data == "admin_pricing")
+async def admin_pricing(call: CallbackQuery):
+    if call.from_user.id != ADMIN_CHAT_ID: return await call.answer("⛔️ Доступ запрещён.")
+    await call.answer()
+    await call.message.edit_text(f"💰 **Текущая цена подписки**\n\n{SUBSCRIPTION_PRICE}\n\nБезлимит + премиум-PDF")
+
+@dp.callback_query(F.data == "admin_grant")
+async def admin_grant_start(call: CallbackQuery):
+    if call.from_user.id != ADMIN_CHAT_ID: return await call.answer("⛔️ Доступ запрещён.")
+    await call.answer()
+    await call.message.edit_text("🔑 Отправь мне сообщение в формате:\n/grant <user_id> <дней>")
+
+@dp.callback_query(F.data == "admin_revoke")
+async def admin_revoke_start(call: CallbackQuery):
+    if call.from_user.id != ADMIN_CHAT_ID: return await call.answer("⛔️ Доступ запрещён.")
+    await call.answer()
+    await call.message.edit_text("🚫 Отправь мне сообщение в формате:\n/revoke <user_id>")
+
+# === Поиск по названию ===
+@dp.message(F.text & ~F.text.startswith("/"))
+async def handle_search(message: Message):
+    text = message.text.strip()
+    inn = "".join(re.findall(r'\d+', text))
+
+    # Если это ИНН/ОГРН — обычный поиск
+    if len(inn) in (10, 12):
+        can_use, remaining, is_premium = await check_limit(message.from_user.id)
+        if not can_use:
+            kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="💰 Купить подписку", callback_data="buy")]])
+            return await message.answer("🛑 Лимит 3 запроса в день исчерпан.", reply_markup=kb)
+
+        wait = await message.answer("🔍 Запрашиваю данные...")
+        data, arbitration_data, cache_time = await get_company_data(inn)
+        if not data:
+            return await wait.edit_text("❌ Данные по ИНН не найдены.")
+
+        score, risks, warnings, color, recommendation, arbitration_data, mass_flags = get_risk_assessment(data, arbitration_data)
+        await log_usage(message.from_user.id, inn, score, is_premium)
+        log_to_sheet(message.from_user.id, inn, score)
+
+        is_ip_flag = is_individual_entrepreneur(data)
+        company_name = data.get('НаимСокр') or data.get('short_name') or data.get('full_name') or '—'
+        director = safe_get_director(data)
+        founders_count = safe_get_founders_count(data)
+
+        res = f"✅ **OSINT PRO v2.8**{' PREM' if is_premium else ''}\n\n"
+        res += f"🏢 {'ИП' if is_ip_flag else 'ЮЛ'} `{company_name}`\n"
+        res += f"📋 ИНН `{data.get('ИНН', inn)}` | ОГРН `{data.get('ОГРН', '—')}`\n\n"
+        res += f"📌 **Статус:** {get_company_status(data)[1]} {get_company_status(data)[0]}\n"
+        res += f"📅 Зарегистрирована {calculate_age(data.get('ДатаРег', ''))}\n"
+        res += f"👤 Руководитель: {director}\n"
+        res += f"📍 {get_formatted_address(data)[:160]}...\n"
+        if founders_count:
+            res += f"👥 Учредителей: {founders_count} шт.\n"
+        if data.get("Контакты"):
+            res += f"📞 Контакты: {len(data.get('Контакты', []))} шт.\n"
+        res += f"\n🛡️ **Индекс безопасности:** `{score}/100`\n"
+        res += f"📌 **Рекомендация:** {recommendation}\n\n"
+        if not is_premium:
+            res += f"Осталось бесплатных запросов: **{remaining}/3**\n\n"
+        res += "📄 **Полный профессиональный отчёт в PDF**"
+
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📥 Скачать PDF", callback_data=f"pdf_{inn}")],
+            [InlineKeyboardButton(text="🔄 Обновить данные", callback_data=f"refresh_{inn}")]
+        ])
+
+        await wait.delete()
+        await message.answer(res, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+        return
+
+    # === НОВОЕ: Поиск по названию ===
+    wait = await message.answer("🔎 Ищу компании по названию...")
+    results = await search_by_name(text)
+    if not results:
+        return await wait.edit_text("❌ Компании с таким названием не найдены.\n\nПопробуйте уточнить название или введите ИНН.")
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[])
+    for item in results[:8]:  # максимум 8 результатов
+        inn_found = item.get("ИНН") or item.get("inn")
+        name = item.get("НаимСокр") or item.get("НаимПолн") or item.get("name") or "Без названия"
+        if inn_found:
+            kb.inline_keyboard.append([InlineKeyboardButton(
+                text=f"📋 {name[:45]}... (ИНН {inn_found})",
+                callback_data=f"select_{inn_found}"
+            )])
+
+    await wait.edit_text(f"✅ Найдено {len(results)} совпадений.\nВыберите компанию:", reply_markup=kb)
+
+@dp.callback_query(F.data.startswith("select_"))
+async def handle_select(call: CallbackQuery):
+    inn = call.data.split("_", 1)[1]
+    await call.answer("Открываю отчёт...")
+    # Просто переиспользуем логику PDF и данных
+    try:
+        data, arbitration_data, cache_time = await get_company_data(inn)
+        if not data:
+            return await call.message.answer("❌ Данные не найдены.")
+
+        is_premium = await is_subscribed(call.from_user.id)
+        score, risks, warnings, color, recommendation, arbitration_data, mass_flags = get_risk_assessment(data, arbitration_data)
+
+        pdf_buffer = create_pro_pdf(
+            data, score, risks, warnings, color, recommendation,
+            arbitration_data, mass_flags, is_premium, cache_time
+        )
+
+        await call.message.answer_document(
+            BufferedInputFile(pdf_buffer.read(), filename=f"OSINT_PRO_{inn}_v2.8.pdf"),
+            caption="✅ Подробный профессиональный отчёт OSINT PRO v2.8"
+        )
+    except Exception as e:
+        logger.error(f"Select error: {e}")
+        await call.message.answer("❌ Ошибка открытия отчёта.")
+
+# Остальные обработчики (PDF, refresh, buy, history, admin-команды) остались без изменений
+@dp.callback_query(F.data.startswith("pdf_"))
+async def send_pdf(call: CallbackQuery):
+    inn = call.data.split("_", 1)[1]
+    await call.answer("Генерирую PDF...")
+    try:
+        data, arbitration_data, cache_time = await get_company_data(inn)
+        if not data:
+            raise ValueError("Нет данных")
+        is_premium = await is_subscribed(call.from_user.id)
+        score, risks, warnings, color, recommendation, arbitration_data, mass_flags = get_risk_assessment(data, arbitration_data)
+        pdf_buffer = create_pro_pdf(
+            data, score, risks, warnings, color, recommendation,
+            arbitration_data, mass_flags, is_premium, cache_time
+        )
+        await call.message.answer_document(
+            BufferedInputFile(pdf_buffer.read(), filename=f"OSINT_PRO_{inn}_v2.8.pdf"),
+            caption="✅ Подробный профессиональный отчёт OSINT PRO v2.8"
+        )
+    except Exception as e:
+        logger.error(f"PDF error INN {inn}", exc_info=True)
+        await call.message.answer("❌ Не удалось сгенерировать PDF. Попробуйте позже.")
+
+@dp.callback_query(F.data.startswith("refresh_"))
+async def handle_refresh(call: CallbackQuery):
+    inn = call.data.split("_", 1)[1]
+    await call.answer("🔄 Очищаем кэш...")
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute("DELETE FROM cache WHERE inn = ?", (inn,))
+        await db.commit()
+    await call.message.answer("✅ **Кэш очищен!** Пришлите ИНН / ОГРН ещё раз.")
+
+@dp.callback_query(F.data == "buy")
+async def buy_subscription(call: CallbackQuery):
+    await call.answer()
+    await call.message.answer(f"💰 **Подписка OSINT PRO**\n\nБезлимит + премиум-отчёты — {SUBSCRIPTION_PRICE}\n\nПосле оплаты напишите @ваш_логин с чеком.")
 
 @dp.message(Command("history"))
 async def cmd_history(message: Message):
@@ -612,102 +816,37 @@ async def cmd_history(message: Message):
         logger.error(f"History error: {e}")
         await message.answer("❌ Не удалось загрузить историю.")
 
-@dp.message(F.text)
-async def handle_search(message: Message):
-    inn = "".join(re.findall(r'\d+', message.text))
-    if len(inn) not in (10, 12):
-        return
-
-    can_use, remaining, is_premium = await check_limit(message.from_user.id)
-    if not can_use:
-        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="💰 Купить подписку", callback_data="buy")]])
-        return await message.answer("🛑 Лимит 3 запроса в день исчерпан.", reply_markup=kb)
-
-    wait = await message.answer("🔍 Запрашиваю данные из Checko.ru...")
-
-    data, arbitration_data, cache_time = await get_company_data(inn)
-    if not data:
-        return await wait.edit_text("❌ Данные по ИНН не найдены.")
-
-    score, risks, warnings, color, recommendation, arbitration_data, mass_flags = get_risk_assessment(data, arbitration_data)
-
-    await log_usage(message.from_user.id, inn, score, is_premium)
-    log_to_sheet(message.from_user.id, inn, score)
-
-    is_ip_flag = is_individual_entrepreneur(data)
-    company_name = data.get('НаимСокр') or data.get('short_name') or data.get('full_name') or '—'
-    director = safe_get_director(data)
-    founders_count = safe_get_founders_count(data)
-
-    res = f"✅ **OSINT PRO v2.8**{' PREM' if is_premium else ''}\n\n"
-    res += f"🏢 {'ИП' if is_ip_flag else 'ЮЛ'} `{company_name}`\n"
-    res += f"📋 ИНН `{data.get('ИНН', inn)}` | ОГРН `{data.get('ОГРН', '—')}`\n\n"
-    res += f"📌 **Статус:** {get_company_status(data)[1]} {get_company_status(data)[0]}\n"
-    res += f"📅 Зарегистрирована {calculate_age(data.get('ДатаРег', ''))}\n"
-    res += f"👤 Руководитель: {director}\n"
-    res += f"📍 {get_formatted_address(data)[:160]}...\n"
-    if founders_count:
-        res += f"👥 Учредителей: {founders_count} шт.\n"
-    if data.get("Контакты"):
-        res += f"📞 Контакты: {len(data.get('Контакты', []))} шт.\n"
-    res += f"\n🛡️ **Индекс безопасности:** `{score}/100`\n"
-    res += f"📌 **Рекомендация:** {recommendation}\n\n"
-    if not is_premium:
-        res += f"Осталось бесплатных запросов: **{remaining}/3**\n\n"
-    res += "📄 **Полный профессиональный отчёт в PDF**"
-
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📥 Скачать PDF", callback_data=f"pdf_{inn}")],
-        [InlineKeyboardButton(text="🔄 Обновить данные", callback_data=f"refresh_{inn}")]
-    ])
-
-    await wait.delete()
-    await message.answer(res, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
-
-@dp.callback_query(F.data.startswith("pdf_"))
-async def send_pdf(call: CallbackQuery):
-    inn = call.data.split("_", 1)[1]
-    await call.answer("Генерирую PDF...")
-
+# текстовые админ-команды (для совместимости)
+@dp.message(Command("grant"))
+async def cmd_grant(message: Message):
+    if message.from_user.id != ADMIN_CHAT_ID: return await message.answer("⛔️ Доступ запрещён.")
     try:
-        data, arbitration_data, cache_time = await get_company_data(inn)
-        if not data:
-            raise ValueError("Нет данных")
+        _, user_id_str, days_str = message.text.split()
+        await grant_subscription(int(user_id_str), int(days_str))
+        await message.answer(f"✅ Подписка выдана пользователю {user_id_str} на {days_str} дней")
+    except:
+        await message.answer("❌ Формат: /grant <user_id> <дней>")
 
-        is_premium = await is_subscribed(call.from_user.id)
-        score, risks, warnings, color, recommendation, arbitration_data, mass_flags = get_risk_assessment(data, arbitration_data)
+@dp.message(Command("revoke"))
+async def cmd_revoke(message: Message):
+    if message.from_user.id != ADMIN_CHAT_ID: return await message.answer("⛔️ Доступ запрещён.")
+    try:
+        _, user_id_str = message.text.split()
+        await revoke_subscription(int(user_id_str))
+        await message.answer(f"✅ Подписка отозвана у пользователя {user_id_str}")
+    except:
+        await message.answer("❌ Формат: /revoke <user_id>")
 
-        pdf_buffer = create_pro_pdf(
-            data, score, risks, warnings, color, recommendation,
-            arbitration_data, mass_flags, is_premium, cache_time
-        )
+@dp.message(Command("stats"))
+async def cmd_stats(message: Message):
+    if message.from_user.id != ADMIN_CHAT_ID: return await message.answer("⛔️ Доступ запрещён.")
+    stats_text = await get_stats()
+    await message.answer(stats_text, parse_mode=ParseMode.MARKDOWN)
 
-        await call.message.answer_document(
-            BufferedInputFile(pdf_buffer.read(), filename=f"OSINT_PRO_{inn}_v2.8.pdf"),
-            caption="✅ Подробный профессиональный отчёт OSINT PRO v2.8"
-        )
-    except Exception as e:
-        logger.error(f"PDF error INN {inn}", exc_info=True)
-        await call.message.answer("❌ Не удалось сгенерировать PDF. Попробуйте позже.")
-
-@dp.callback_query(F.data.startswith("refresh_"))
-async def handle_refresh(call: CallbackQuery):
-    inn = call.data.split("_", 1)[1]
-    await call.answer("🔄 Очищаем кэш...")
-
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute("DELETE FROM cache WHERE inn = ?", (inn,))
-        await db.commit()
-
-    await call.message.answer(
-        "✅ **Кэш очищен!**\n\n"
-        "Пришлите ИНН / ОГРН ещё раз — данные будут запрошены заново из Checko.ru"
-    )
-
-@dp.callback_query(F.data == "buy")
-async def buy_subscription(call: CallbackQuery):
-    await call.answer()
-    await call.message.answer(f"💰 **Подписка OSINT PRO**\n\nБезлимит + премиум-отчёты — {SUBSCRIPTION_PRICE}\n\nПосле оплаты напишите @ваш_логин с чеком.")
+@dp.message(Command("pricing"))
+async def cmd_pricing(message: Message):
+    if message.from_user.id != ADMIN_CHAT_ID: return await message.answer("⛔️ Доступ запрещён.")
+    await message.answer(f"💰 **Текущая цена подписки**\n\n{SUBSCRIPTION_PRICE}\n\nБезлимит + премиум-PDF")
 
 # ================= WEBHOOK =================
 async def health_handler(request):
@@ -727,7 +866,7 @@ async def main():
     await init_db()
     await bot.delete_webhook(drop_pending_updates=True)
     await bot.set_webhook(url=WEBHOOK_URL)
-    logger.info("🚀 OSINT PRO v2.8-fix запущен с админ-панелью!")
+    logger.info("🚀 OSINT PRO v2.8-fix запущен с поиском по названию + Excel-экспортом + таблицами в PDF!")
     app = web.Application()
     app.router.add_get("/", health_handler)
     app.router.add_post("/webhook", webhook_handler)
