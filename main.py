@@ -82,19 +82,22 @@ if GOOGLE_CREDENTIALS and SHEET_ID:
     except Exception as e:
         logger.error(f"Google Sheets error: {e}")
 
-def log_to_sheet(user_id, inn, status):
+def log_to_sheet(user_id, inn, score: int):
     if not gc or not SHEET_ID:
         return
     try:
         sh = gc.open_by_key(SHEET_ID)
         worksheet = sh.sheet1
+        now = datetime.now()
         worksheet.append_row([
-            datetime.now().strftime("%d.%m.%Y %H:%M:%S"),
-            str(user_id),
-            inn,
-            status,
-            datetime.now().strftime("%H:%M:%S")
+            now.strftime("%d.%m.%Y %H:%M:%S"),   # Дата
+            str(user_id),                         # Пользователь (chat_id)
+            inn,                                  # ИНН/ОГРН
+            f"score:{score}",                     # Статус
+            "Бесплатный",                         # Тип отчёта
+            now.strftime("%H:%M:%S")              # Время обработки
         ])
+        logger.info(f"✅ Запись в Google Sheets: {user_id} | {inn} | score:{score}")
     except Exception as e:
         logger.error(f"Sheet write error: {e}")
 
@@ -115,12 +118,16 @@ def get_risk_assessment(data: dict):
                 risk_factors.append("🟡 Молодая компания (менее 3 лет)")
         except:
             pass
-    status = str(data.get('status') or data.get('status_text') or "").lower()
+
+    # Новый API не имеет status/status_text, но оставляем на будущее
+    status = str(data.get('status') or data.get('status_text') or data.get('sv_status_msg', '')).lower()
     if any(x in status for x in ["ликвидац", "банкрот", "прекращ"]):
         score -= 80
         risk_factors.append("🚨 ОПАСНО: в процессе ликвидации / банкротства")
-    if score > 60:
+
+    if score > 60 and not risk_factors:
         risk_factors.append("✅ Критических арбитражных дел не обнаружено")
+
     color = colors.green if score > 70 else colors.orange if score > 40 else colors.red
     return score, risk_factors, color
 
@@ -146,11 +153,20 @@ def create_pro_pdf(data: dict, score: int, risks: list, color: colors):
     c.setFillColor(colors.black)
     c.setFont(FONT_NAME, 16)
     c.drawString(270, h - 165, f"{score} / 100")
+
+    # Исправлено: теперь берём правильное название компании
+    company_name = (
+        data.get('short_name') or 
+        data.get('full_name') or 
+        data.get('name') or 
+        "Н/Д"
+    )
+
     y = h - 220
     info = [
-        ("Организация:", data.get('name') or data.get('short_name') or "Н/Д"),
+        ("Организация:", company_name),
         ("ИНН:", data.get('inn', "Н/Д")),
-        ("Статус:", data.get('status_text') or data.get('status') or "Действует"),
+        ("Статус:", data.get('status_text') or data.get('status') or data.get('sv_status_msg', "Действует")),
         ("Дата регистрации:", data.get('reg_date', "Н/Д")),
         ("Адрес:", data.get('address', "Информация ограничена"))
     ]
@@ -161,6 +177,7 @@ def create_pro_pdf(data: dict, score: int, risks: list, color: colors):
         c.setFillColor(colors.black)
         c.drawString(180, y, str(val))
         y -= 28
+
     y -= 20
     c.setStrokeColor(colors.lightgrey)
     c.line(50, y, 550, y)
@@ -172,6 +189,7 @@ def create_pro_pdf(data: dict, score: int, risks: list, color: colors):
     for risk in risks:
         c.drawString(60, y, risk)
         y -= 22
+
     c.showPage()
     c.save()
     buffer.seek(0)
@@ -192,29 +210,42 @@ async def handle_search(message: Message):
     inn = "".join(re.findall(r'\d+', message.text))
     if len(inn) not in (10, 12):
         return
+
     if not await check_limit(message.from_user.id):
         kb = InlineKeyboardMarkup(inline_keyboard=[[
             InlineKeyboardButton(text="💰 Купить подписку", callback_data="buy")
         ]])
         return await message.answer("🛑 Лимит 3 запроса в день исчерпан.", reply_markup=kb)
+
     wait = await message.answer("🔍 Идёт анализ по реестрам ФНС...")
+
     async with aiohttp.ClientSession() as session:
         async with session.get(f"https://egrul.org/short_data/?id={inn}") as resp:
             data = await resp.json(content_type=None) if resp.status == 200 else None
-    if not data:
+
+    if not data or not isinstance(data, dict):
         return await wait.edit_text("❌ Данные по ИНН не найдены.")
+
     await log_usage(message.from_user.id)
     score, risks, color = get_risk_assessment(data)
-    log_to_sheet(message.from_user.id, inn, f"score:{score}")
+
+    # Исправлено логирование в Google Sheets
+    log_to_sheet(message.from_user.id, inn, score)
+
+    # Исправлено: теперь название компании всегда подтягивается
+    company_name = data.get('short_name') or data.get('full_name') or data.get('name') or '—'
+
     res = (
         f"✅ **ОТЧЁТ OSINT PRO**\n\n"
-        f"🏢 `{data.get('name') or '—'}`\n"
+        f"🏢 `{company_name}`\n"
         f"🛡️ Индекс безопасности: `{score}/100`\n"
         f"📄 Полный аудит в PDF ниже."
     )
+
     kb = InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="📥 Скачать PDF", callback_data=f"pdf_{inn}")
     ]])
+
     await wait.delete()
     await message.answer(res, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
 
@@ -222,11 +253,14 @@ async def handle_search(message: Message):
 async def send_pdf(call: CallbackQuery):
     inn = call.data.split("_")[1]
     await call.answer("Генерирую PDF...")
+
     async with aiohttp.ClientSession() as session:
         async with session.get(f"https://egrul.org/short_data/?id={inn}") as resp:
             data = await resp.json(content_type=None)
+
     score, risks, color = get_risk_assessment(data)
     pdf_buffer = create_pro_pdf(data, score, risks, color)
+
     await call.message.answer_document(
         BufferedInputFile(pdf_buffer.read(), filename=f"OSINT_PRO_{inn}.pdf"),
         caption="✅ Аналитический отчёт готов"
@@ -249,25 +283,16 @@ async def webhook_handler(request):
     try:
         data = await request.json()
         update = Update.model_validate(data)
-
-        # ← ИСПРАВЛЕНИЕ: aiogram 3.x использует dp.feed_update
         await dp.feed_update(bot=bot, update=update)
-
-        # Для отладки (можно потом удалить)
         logger.info(f"✅ Update обработан (update_id={update.update_id})")
-
         return web.Response(text="OK", status=200)
-
     except Exception as e:
         logger.error(f"Webhook error: {e}")
-        # Telegram ОБЯЗАТЕЛЬНО должен получать 200
         return web.Response(text="OK", status=200)
 
 # ================= MAIN =================
 async def main():
     await init_db()
-    
-    # Удаляем старый вебхук и ставим новый
     await bot.delete_webhook(drop_pending_updates=True)
     await bot.set_webhook(url=WEBHOOK_URL)
     logger.info(f"✅ Webhook установлен: {WEBHOOK_URL}")
@@ -282,8 +307,6 @@ async def main():
     await site.start()
 
     logger.info("🚀 OSINT PRO v2.0 запущен успешно!")
-    
-    # Держим сервис живым
     await asyncio.Event().wait()
 
 if __name__ == "__main__":
