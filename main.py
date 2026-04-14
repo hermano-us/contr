@@ -38,9 +38,9 @@ bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
 if CHECKO_API_KEY:
-    logger.info("✅ Checko API подключён")
+    logger.info("✅ Checko API подключён — полный профиль компании")
 else:
-    logger.warning("⚠️ CHECKO_API_KEY не задан — арбитраж отключён")
+    logger.warning("⚠️ CHECKO_API_KEY не задан — используется только ЕГРЮЛ")
 
 # ================= FONT =================
 FONT_NAME = "DejaVuSans"
@@ -55,18 +55,13 @@ else:
 # ================= DATABASE =================
 async def init_db():
     async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute('''CREATE TABLE IF NOT EXISTS usage_log
-                           (user_id INTEGER, query_date DATE DEFAULT CURRENT_DATE)''')
-        await db.execute('''CREATE TABLE IF NOT EXISTS subscriptions
-                           (user_id INTEGER PRIMARY KEY, until_date DATE)''')
+        await db.execute('''CREATE TABLE IF NOT EXISTS usage_log (user_id INTEGER, query_date DATE DEFAULT CURRENT_DATE)''')
+        await db.execute('''CREATE TABLE IF NOT EXISTS subscriptions (user_id INTEGER PRIMARY KEY, until_date DATE)''')
         await db.commit()
 
 async def is_subscribed(user_id: int) -> bool:
     async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute(
-            "SELECT until_date FROM subscriptions WHERE user_id = ?",
-            (user_id,)
-        ) as cursor:
+        async with db.execute("SELECT until_date FROM subscriptions WHERE user_id = ?", (user_id,)) as cursor:
             row = await cursor.fetchone()
             if not row or not row[0]:
                 return False
@@ -79,10 +74,7 @@ async def check_limit(user_id: int) -> tuple[bool, int, bool]:
     try:
         async with aiosqlite.connect(DB_NAME) as db:
             today = date.today().isoformat()
-            async with db.execute(
-                "SELECT COUNT(*) FROM usage_log WHERE user_id = ? AND query_date = ?",
-                (user_id, today)
-            ) as cursor:
+            async with db.execute("SELECT COUNT(*) FROM usage_log WHERE user_id = ? AND query_date = ?", (user_id, today)) as cursor:
                 row = await cursor.fetchone()
                 used = row[0] if row else 0
                 remaining = max(0, FREE_LIMIT - used)
@@ -101,43 +93,47 @@ async def log_usage(user_id: int, is_premium: bool):
 async def grant_subscription(user_id: int, days: int):
     until = (date.today() + timedelta(days=days)).isoformat()
     async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute(
-            "INSERT OR REPLACE INTO subscriptions (user_id, until_date) VALUES (?, ?)",
-            (user_id, until)
-        )
+        await db.execute("INSERT OR REPLACE INTO subscriptions (user_id, until_date) VALUES (?, ?)", (user_id, until))
         await db.commit()
-    logger.info(f"Подписка выдана {user_id} до {until}")
 
 async def revoke_subscription(user_id: int):
     async with aiosqlite.connect(DB_NAME) as db:
         await db.execute("DELETE FROM subscriptions WHERE user_id = ?", (user_id,))
         await db.commit()
-    logger.info(f"Подписка снята с {user_id}")
 
-# ================= HELPERS =================
-def get_formatted_address(data: dict) -> str:
-    if isinstance(data.get('address_struct'), dict):
-        s = data['address_struct']
-        parts = [s.get('index'), s.get('region'), s.get('city') or s.get('settlement'), s.get('street'), s.get('house')]
-        return ', '.join(filter(None, parts)) or data.get('address', 'Н/Д')
-    return data.get('address', 'Н/Д')
+# ================= API HELPERS =================
+async def get_checko_company(inn: str) -> dict | None:
+    if not CHECKO_API_KEY:
+        return None
+    try:
+        async with aiohttp.ClientSession() as session:
+            url = "https://api.checko.ru/v2/company"
+            params = {"key": CHECKO_API_KEY, "inn": inn}
+            async with session.get(url, params=params, timeout=12) as resp:
+                if resp.status != 200:
+                    return None
+                data = await resp.json()
+                return data.get("data") if data.get("meta", {}).get("status") == "ok" else None
+    except Exception as e:
+        logger.error(f"Checko error: {e}")
+        return None
 
-def get_company_status(data: dict) -> tuple[str, str]:
-    status = str(data.get('status_text') or data.get('status') or data.get('sv_status_msg') or "Действует").lower()
-    if any(word in status for word in ["ликвидац", "прекращ", "ликвидирован"]):
-        return "В процессе ликвидации / ликвидирована", "🚨"
-    if any(word in status for word in ["банкрот", "банкротство"]):
-        return "В процедуре банкротства", "❌"
-    if any(word in status for word in ["недейств", "исключен"]):
-        return "Недействующий статус", "⚠️"
-    return "Действует", "✅"
+async def get_egrul_data(inn: str) -> dict | None:
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(f"https://egrul.org/short_data/?id={inn}", timeout=8) as resp:
+                if resp.status == 200:
+                    return await resp.json(content_type=None)
+    except:
+        pass
+    return None
 
 async def get_arbitration_data(inn: str) -> dict | None:
     if not CHECKO_API_KEY:
         return None
     try:
         async with aiohttp.ClientSession() as session:
-            url = f"https://api.checko.ru/v2/legal-cases"
+            url = "https://api.checko.ru/v2/legal-cases"
             params = {"key": CHECKO_API_KEY, "inn": inn}
             async with session.get(url, params=params, timeout=8) as resp:
                 if resp.status != 200:
@@ -147,53 +143,65 @@ async def get_arbitration_data(inn: str) -> dict | None:
         logger.error(f"Arbitration error: {e}")
         return None
 
+# ================= HELPERS =================
+def get_formatted_address(data: dict) -> str:
+    if isinstance(data.get("ЮрАдрес"), dict):
+        return data["ЮрАдрес"].get("АдресРФ") or data.get("address", "Н/Д")
+    return data.get("address", "Н/Д")
+
+def calculate_age(reg_date_str: str) -> str:
+    if not reg_date_str:
+        return "Н/Д"
+    try:
+        reg_date = datetime.strptime(reg_date_str[:10], '%Y-%m-%d')
+        delta = datetime.now() - reg_date
+        years = delta.days // 365
+        months = (delta.days % 365) // 30
+        return f"{reg_date.strftime('%d.%m.%Y')} ({years} лет {months} мес.)"
+    except:
+        return reg_date_str
+
+def get_company_status(data: dict) -> tuple[str, str]:
+    status = str(data.get('Статус', {}).get('Наим') or data.get('status_text') or data.get('status') or "Действует").lower()
+    if any(word in status for word in ["ликвидац", "прекращ", "ликвидирован"]):
+        return "В процессе ликвидации / ликвидирована", "🚨"
+    if any(word in status for word in ["банкрот", "банкротство"]):
+        return "В процедуре банкротства", "❌"
+    if any(word in status for word in ["недейств", "исключен"]):
+        return "Недействующий статус", "⚠️"
+    return "Действует", "✅"
+
 def get_risk_assessment(data: dict, arbitration_data: dict | None = None):
     score = 100
     risk_factors = []
     warnings = []
     mass_flags = []
 
-    reg_date_str = data.get('reg_date', '')
+    # Возраст компании
+    reg_date_str = data.get('ДатаРег') or data.get('reg_date', '')
     if reg_date_str:
         try:
-            reg_date = datetime.strptime(reg_date_str, '%Y-%m-%d')
+            reg_date = datetime.strptime(reg_date_str[:10], '%Y-%m-%d')
             years = (datetime.now() - reg_date).days / 365.25
             if years < 0.5:
                 score -= 50
                 risk_factors.append("🚨 Крайне молодая компания (менее 6 месяцев)")
             elif years < 1:
                 score -= 35
-                risk_factors.append("⚠️ Критическая новизна: компания меньше года")
+                risk_factors.append("⚠️ Критическая новизна")
             elif years < 3:
                 score -= 15
-                risk_factors.append("🟡 Молодая компания (менее 3 лет)")
+                risk_factors.append("🟡 Молодая компания")
         except:
             pass
 
-    if data.get('invalid_address') == 1:
-        score -= 40
-        risk_factors.append("🚨 Недостоверный / массовый адрес")
-        warnings.append(data.get('invalid_address_msg', 'Массовый адрес'))
+    # Массовый адрес
+    if data.get("ЮрАдрес", {}).get("МассАдрес"):
+        score -= 30
+        risk_factors.append("🚨 Массовый юридический адрес")
         mass_flags.append("Адрес")
-    if data.get('invalid_founder') == 1:
-        score -= 35
-        risk_factors.append("🚨 Недостоверные / массовые учредители")
-        warnings.append(data.get('invalid_founder_msg', 'Массовые учредители'))
-        mass_flags.append("Учредители")
-    if data.get('invalid_chief') == 1:
-        score -= 40
-        risk_factors.append("🚨 Недостоверный / массовый руководитель")
-        warnings.append(data.get('invalid_chief_msg', 'Массовый руководитель'))
-        mass_flags.append("Руководитель")
 
-    if data.get('sv_status_msg'):
-        warnings.append(data.get('sv_status_msg'))
-
-    status_lower = str(data.get('status') or data.get('status_text') or data.get('sv_status_msg', '')).lower()
-    if any(x in status_lower for x in ["ликвидац", "банкрот", "прекращ", "недейств"]):
-        score -= 80
-        risk_factors.append("🚨 ОПАСНО: ликвидация / банкротство / недействующий статус")
-
+    # Арбитраж
     arb_count = 0
     if arbitration_data and isinstance(arbitration_data, dict):
         arb_count = arbitration_data.get("total", 0) or len(arbitration_data.get("cases", []))
@@ -205,11 +213,11 @@ def get_risk_assessment(data: dict, arbitration_data: dict | None = None):
         risk_factors.append("✅ Критических рисков не обнаружено")
 
     color = colors.green if score > 75 else colors.orange if score > 45 else colors.red
-    recommendation = "✅ Рекомендуется к работе" if score > 80 else "🟡 Требует дополнительной проверки" if score >= 60 else "🚫 Высокий риск! Не рекомендуется"
+    recommendation = "✅ Рекомендуется к работе" if score > 80 else "🟡 Требует дополнительной проверки" if score >= 60 else "🚫 Высокий риск!"
 
     return score, risk_factors, warnings, color, recommendation, arbitration_data, mass_flags
 
-# ================= PDF v2.7 =================
+# ================= PDF v2.8 =================
 def draw_multiline(c, x, y, text, font_size=10, max_width=480, line_height=14):
     if not text:
         return y
@@ -235,20 +243,20 @@ def create_pro_pdf(data: dict, score: int, risks: list, warnings: list, color: c
 
     # ШАПКА
     c.setFillColor(colors.HexColor("#1a237e"))
-    c.setFont(FONT_NAME, 28)
-    c.drawString(50, y, "OSINT PRO v2.7")
+    c.setFont(FONT_NAME, 26)
+    c.drawString(50, y, "OSINT PRO v2.8")
     if is_premium:
         c.setFillColor(colors.HexColor("#00b300"))
-        c.drawString(380, y - 8, "PREMIUM")
-    c.setFont(FONT_NAME, 12)
+        c.drawString(380, y - 5, "PREMIUM")
+    c.setFont(FONT_NAME, 11)
     c.setFillColor(colors.grey)
     c.drawString(50, y - 28, f"ПРОФЕССИОНАЛЬНЫЙ АНАЛИТИЧЕСКИЙ ОТЧЁТ • {datetime.now().strftime('%d.%m.%Y %H:%M')}")
-    y -= 80
+    y -= 75
 
-    full_name = data.get('full_name') or data.get('short_name') or "Н/Д"
-    c.setFont(FONT_NAME, 18)
+    full_name = data.get('НаимПолн') or data.get('full_name') or "Н/Д"
+    c.setFont(FONT_NAME, 16)
     c.setFillColor(colors.black)
-    y = draw_multiline(c, 50, y, full_name, font_size=18, max_width=480, line_height=22)
+    y = draw_multiline(c, 50, y, full_name, font_size=16, max_width=480, line_height=20)
     y -= 35
 
     # ИНДЕКС БЕЗОПАСНОСТИ
@@ -281,21 +289,18 @@ def create_pro_pdf(data: dict, score: int, risks: list, warnings: list, color: c
     c.setFont(FONT_NAME, 10)
     c.setFillColor(colors.grey)
 
-    director = f"{data.get('chief_position', '')} {data.get('chief', 'Н/Д')}".strip() or "Н/Д"
-    branches_count = len(data.get('branches', {})) if isinstance(data.get('branches'), dict) else 0
+    director = data.get('Руковод', [{}])[0].get('ФИО', 'Н/Д') if data.get('Руковод') else 'Н/Д'
+    branches = len(data.get('Филиалы', [])) if isinstance(data.get('Филиалы'), list) else 0
 
     fields = [
-        ("Полное наименование", full_name),
-        ("Сокращённое", data.get('short_name', '—')),
-        ("ИНН", data.get('inn', '—')),
-        ("ОГРН", data.get('ogrn', '—')),
-        ("КПП", data.get('kpp', '—')),
+        ("ИНН", data.get('ИНН', '—')),
+        ("ОГРН", data.get('ОГРН', '—')),
+        ("КПП", data.get('КПП', '—')),
         ("Руководитель", director),
-        ("Дата регистрации", calculate_age(data.get('reg_date', ''))),
+        ("Дата регистрации", calculate_age(data.get('ДатаРег', ''))),
         ("Адрес", get_formatted_address(data)),
-        ("Уставный капитал", data.get('capital', '—')),
-        ("Основной ОКВЭД", data.get('main_okved', data.get('okved', '—'))),
-        ("Филиалы", f"{branches_count} шт." if branches_count else "—"),
+        ("Уставный капитал", data.get('УставКапитал', '—')),
+        ("Филиалы", f"{branches} шт." if branches else "—"),
     ]
 
     for label, value in fields:
@@ -304,43 +309,42 @@ def create_pro_pdf(data: dict, score: int, risks: list, warnings: list, color: c
         y -= 8
     y -= 25
 
-    # ПОДРОБНЫЙ АДРЕС
-    c.setFont(FONT_NAME, 13)
-    c.setFillColor(colors.black)
-    c.drawString(50, y, "Подробный адрес (ЕГРЮЛ)")
-    y -= 22
-    c.setFont(FONT_NAME, 10)
-    c.setFillColor(colors.grey)
-    y = draw_multiline(c, 60, y, get_formatted_address(data), max_width=480)
-    y -= 25
-
-    # ФИЛИАЛЫ
-    if branches_count > 0:
+    # КОНТАКТЫ
+    contacts = data.get("Контакты", [])
+    if contacts:
         c.setFont(FONT_NAME, 13)
         c.setFillColor(colors.blue)
-        c.drawString(50, y, f"🌳 Филиалы и подразделения ({branches_count} шт.)")
-        y -= 22
-        c.setFont(FONT_NAME, 9)
-        c.setFillColor(colors.black)
-        branch_list = list(data.get('branches', {}).values())[:8]
-        for b in branch_list:
-            name = b.get('full_name', '—')
-            addr = b.get('uraddress', '—')
-            y = draw_multiline(c, 60, y, f"• {name} — {addr}", max_width=480)
-            y -= 4
-        if branches_count > 8:
-            y = draw_multiline(c, 60, y, f"...и ещё {branches_count - 8} филиалов", max_width=480)
-        y -= 15
-
-    # ПРЕДУПРЕЖДЕНИЯ ЕГРЮЛ
-    if warnings or mass_flags:
-        c.setFont(FONT_NAME, 13)
-        c.setFillColor(colors.orange)
-        c.drawString(50, y, "⚠️ Сведения ЕГРЮЛ о статусе и рисках")
+        c.drawString(50, y, "📞 Контакты")
         y -= 22
         c.setFont(FONT_NAME, 10)
         c.setFillColor(colors.black)
-        for w in warnings:
+        for contact in contacts[:8]:
+            y = draw_multiline(c, 60, y, f"• {contact}", max_width=480)
+            y -= 5
+        y -= 15
+
+    # УЧРЕДИТЕЛИ
+    uchred = data.get("Учред", {})
+    if uchred:
+        c.setFont(FONT_NAME, 13)
+        c.setFillColor(colors.black)
+        c.drawString(50, y, "👥 Учредители")
+        y -= 22
+        c.setFont(FONT_NAME, 9)
+        for fl in uchred.get("ФЛ", [])[:6]:
+            y = draw_multiline(c, 60, y, f"• {fl.get('ФИО', '—')} — {fl.get('Доля', '—')}%", max_width=480)
+            y -= 4
+        y -= 15
+
+    # РИСКИ И ПРЕДУПРЕЖДЕНИЯ
+    if mass_flags or warnings:
+        c.setFont(FONT_NAME, 13)
+        c.setFillColor(colors.orange)
+        c.drawString(50, y, "⚠️ Сведения ЕГРЮЛ о рисках")
+        y -= 22
+        c.setFont(FONT_NAME, 10)
+        c.setFillColor(colors.black)
+        for w in warnings + mass_flags:
             y = draw_multiline(c, 60, y, f"• {w}", max_width=480)
             y -= 6
         y -= 15
@@ -354,7 +358,7 @@ def create_pro_pdf(data: dict, score: int, risks: list, warnings: list, color: c
             c.drawString(50, y, f"⚖️ Арбитражные дела — {arb_count} шт.")
             y -= 30
 
-    # РИСКИ
+    # ЗАКЛЮЧЕНИЕ
     c.setFont(FONT_NAME, 13)
     c.setFillColor(colors.black)
     c.drawString(50, y, "Экспертное заключение и риски")
@@ -365,7 +369,6 @@ def create_pro_pdf(data: dict, score: int, risks: list, warnings: list, color: c
         y = draw_multiline(c, 60, y, f"• {risk}", max_width=480)
         y -= 6
 
-    # РЕКОМЕНДАЦИЯ
     y -= 20
     c.setFont(FONT_NAME, 14)
     c.setFillColor(color)
@@ -374,29 +377,16 @@ def create_pro_pdf(data: dict, score: int, risks: list, warnings: list, color: c
     c.setFont(FONT_NAME, 11)
     c.setFillColor(colors.black)
     c.drawString(60, y, recommendation)
-    y -= 55
 
     # ФУТЕР
     c.setFont(FONT_NAME, 8)
     c.setFillColor(colors.grey)
-    c.drawString(50, 40, f"OSINT PRO v2.7 • Данные: ЕГРЮЛ (egrul.org) + Checko.ru • {datetime.now().strftime('%d.%m.%Y')}")
+    c.drawString(50, 40, f"OSINT PRO v2.8 • Checko.ru + ЕГРЮЛ • {datetime.now().strftime('%d.%m.%Y')}")
     c.drawString(380, 40, "Конфиденциально")
     c.showPage()
     c.save()
     buffer.seek(0)
     return buffer
-
-def calculate_age(reg_date_str: str) -> str:
-    if not reg_date_str:
-        return "Н/Д"
-    try:
-        reg_date = datetime.strptime(reg_date_str, '%Y-%m-%d')
-        delta = datetime.now() - reg_date
-        years = delta.days // 365
-        months = (delta.days % 365) // 30
-        return f"{reg_date.strftime('%d.%m.%Y')} ({years} лет {months} мес.)"
-    except:
-        return reg_date_str
 
 # ================= GOOGLE SHEETS =================
 gc = None
@@ -425,27 +415,18 @@ def log_to_sheet(user_id, inn, score: int):
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
     await message.answer(
-        "🚀 **OSINT PRO v2.7**\n\n"
-        "Самый полный анализ ЕГРЮЛ + арбитраж + риски.\n"
-        "✅ 3 бесплатных запроса в день\n"
-        "💎 Подписка — безлимит + премиум-отчёты за 4900 ₽/мес\n\n"
-        "Пришлите ИНН или ОГРН.",
+        "🚀 **OSINT PRO v2.8**\n\n"
+        "Полный анализ компании из Checko.ru + ЕГРЮЛ\n"
+        "✅ Контакты, учредители, риски, арбитраж\n"
+        "💎 Подписка — безлимит за 4900 ₽/мес\n\n"
+        "Пришлите ИНН или ОГРН",
         parse_mode=ParseMode.MARKDOWN
     )
 
 @dp.message(Command("pricing"))
 async def cmd_pricing(message: Message):
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="💰 Купить подписку", callback_data="buy")]])
-    await message.answer(
-        f"**OSINT PRO — Подписка**\n\n"
-        f"💎 Безлимитные запросы\n"
-        f"🔥 Премиум-отчёты с отметкой\n"
-        f"📈 Приоритетная обработка\n\n"
-        f"Цена: **{SUBSCRIPTION_PRICE}**\n\n"
-        f"После оплаты напишите админу с чеком.",
-        reply_markup=kb,
-        parse_mode=ParseMode.MARKDOWN
-    )
+    await message.answer(f"**Подписка OSINT PRO**\n\nБезлимит + премиум-отчёты — {SUBSCRIPTION_PRICE}\n\nПосле оплаты напишите админу с чеком.", reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
 
 @dp.message(Command("grant"))
 async def admin_grant(message: Message):
@@ -454,7 +435,7 @@ async def admin_grant(message: Message):
     try:
         _, user_id, days = message.text.split()
         await grant_subscription(int(user_id), int(days))
-        await message.answer(f"✅ Подписка выдана пользователю {user_id} на {days} дней")
+        await message.answer(f"✅ Подписка выдана {user_id} на {days} дней")
     except:
         await message.answer("Формат: /grant <user_id> <дней>")
 
@@ -469,12 +450,6 @@ async def admin_revoke(message: Message):
     except:
         await message.answer("Формат: /revoke <user_id>")
 
-@dp.message(Command("stats"))
-async def admin_stats(message: Message):
-    if message.from_user.id != ADMIN_CHAT_ID:
-        return
-    await message.answer("📊 Статистика доступна в Google Sheets.")
-
 @dp.message(F.text)
 async def handle_search(message: Message):
     inn = "".join(re.findall(r'\d+', message.text))
@@ -486,50 +461,41 @@ async def handle_search(message: Message):
         kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="💰 Купить подписку", callback_data="buy")]])
         return await message.answer("🛑 Лимит 3 запроса в день исчерпан.", reply_markup=kb)
 
-    wait = await message.answer("🔍 Глубокий профессиональный анализ ЕГРЮЛ + арбитраж...")
+    wait = await message.answer("🔍 Запрашиваю полные данные из Checko.ru...")
 
-    async with aiohttp.ClientSession() as session:
-        egrul_task = session.get(f"https://egrul.org/short_data/?id={inn}")
-        arb_task = get_arbitration_data(inn) if CHECKO_API_KEY else asyncio.sleep(0)
-        egrul_resp = await egrul_task
-        data = await egrul_resp.json(content_type=None) if egrul_resp.status == 200 else None
-        arbitration_data = await arb_task if CHECKO_API_KEY else None
+    checko_data = await get_checko_company(inn)
+    data = checko_data if checko_data else await get_egrul_data(inn)
+    arbitration_data = await get_arbitration_data(inn) if CHECKO_API_KEY else None
 
-    if not data or not isinstance(data, dict):
+    if not data:
         return await wait.edit_text("❌ Данные по ИНН не найдены.")
 
     await log_usage(message.from_user.id, is_premium)
     score, risks, warnings, color, recommendation, arbitration_data, mass_flags = get_risk_assessment(data, arbitration_data)
     log_to_sheet(message.from_user.id, inn, score)
 
-    status_text, status_emoji = get_company_status(data)
-    company_name = data.get('short_name') or data.get('full_name') or '—'
-    director_info = f"{data.get('chief_position', '')} {data.get('chief', 'Н/Д')}".strip() or "Н/Д"
-    branches_count = len(data.get('branches', {})) if isinstance(data.get('branches'), dict) else 0
+    company_name = data.get('НаимСокр') or data.get('short_name') or data.get('full_name') or '—'
+    director = data.get('Руковод', [{}])[0].get('ФИО', 'Н/Д') if data.get('Руковод') else 'Н/Д'
+    founders_count = len(data.get('Учред', {}).get('ФЛ', [])) + len(data.get('Учред', {}).get('РосОрг', []))
 
-    res = (f"✅ **OSINT PRO v2.7**{' PREM' if is_premium else ''}\n\n"
-           f"🏢 `{company_name}`\n"
-           f"📋 ИНН `{data.get('inn', inn)}` | ОГРН `{data.get('ogrn', 'Н/Д')}` | КПП `{data.get('kpp', 'Н/Д')}`\n\n"
-           f"📌 **Статус:** {status_emoji} {status_text}\n"
-           f"📅 Зарегистрирована {calculate_age(data.get('reg_date', ''))}\n"
-           f"👤 Руководитель: {director_info}\n"
-           f"📍 {get_formatted_address(data)[:180]}...\n"
-           f"🌳 **Филиалы:** {branches_count} шт.\n\n"
-           f"🛡️ **Индекс безопасности:** `{score}/100`\n"
-           f"📌 **Рекомендация:** {recommendation}\n\n")
+    res = f"✅ **OSINT PRO v2.8**{' PREM' if is_premium else ''}\n\n"
+    res += f"🏢 `{company_name}`\n"
+    res += f"📋 ИНН `{data.get('ИНН', inn)}` | ОГРН `{data.get('ОГРН', '—')}`\n\n"
+    res += f"📌 **Статус:** {get_company_status(data)[1]} {get_company_status(data)[0]}\n"
+    res += f"📅 Зарегистрирована {calculate_age(data.get('ДатаРег', ''))}\n"
+    res += f"👤 Руководитель: {director}\n"
+    res += f"📍 {get_formatted_address(data)[:160]}...\n"
+    if founders_count:
+        res += f"👥 Учредителей: {founders_count} шт.\n"
+    if data.get("Контакты"):
+        res += f"📞 Контакты: {len(data.get('Контакты', []))} шт.\n"
 
+    res += f"\n🛡️ **Индекс безопасности:** `{score}/100`\n"
+    res += f"📌 **Рекомендация:** {recommendation}\n\n"
     if not is_premium:
-        res += f"Осталось бесплатных запросов сегодня: **{remaining}/3**\n\n"
-    if warnings:
-        res += f"⚠️ **Сведения ЕГРЮЛ:** {len(warnings)} предупреждений\n"
-    if mass_flags:
-        res += f"⚠️ **Массовость:** по {', '.join(mass_flags)}\n"
-    if arbitration_data:
-        arb_count = arbitration_data.get("total", 0) or len(arbitration_data.get("cases", []))
-        if arb_count > 0:
-            res += f"⚖️ **Арбитраж:** {arb_count} дел\n"
+        res += f"Осталось бесплатных запросов: **{remaining}/3**\n\n"
 
-    res += "\n📄 **Полный профессиональный отчёт в PDF**"
+    res += "📄 **Полный профессиональный отчёт в PDF**"
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="📥 Скачать PDF", callback_data=f"pdf_{inn}")]])
 
     await wait.delete()
@@ -538,17 +504,13 @@ async def handle_search(message: Message):
 @dp.callback_query(F.data.startswith("pdf_"))
 async def send_pdf(call: CallbackQuery):
     inn = call.data.split("_", 1)[1]
-    await call.answer("Генерирую профессиональный PDF-отчёт...")
+    await call.answer("Генерирую подробный PDF-отчёт...")
 
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(f"https://egrul.org/short_data/?id={inn}") as resp:
-                if resp.status != 200:
-                    raise ValueError(f"egrul.org вернул статус {resp.status}")
-                data = await resp.json(content_type=None)
-
-        if not isinstance(data, dict) or not data:
-            raise ValueError("Некорректные данные")
+        checko_data = await get_checko_company(inn)
+        data = checko_data if checko_data else await get_egrul_data(inn)
+        if not data:
+            raise ValueError("Нет данных")
 
         is_premium = await is_subscribed(call.from_user.id)
         arbitration_data = await get_arbitration_data(inn) if CHECKO_API_KEY else None
@@ -557,8 +519,8 @@ async def send_pdf(call: CallbackQuery):
         pdf_buffer = create_pro_pdf(data, score, risks, warnings, color, recommendation, arbitration_data, mass_flags, is_premium)
 
         await call.message.answer_document(
-            BufferedInputFile(pdf_buffer.read(), filename=f"OSINT_PRO_{inn}_v2.7.pdf"),
-            caption="✅ Подробный профессиональный отчёт OSINT PRO v2.7"
+            BufferedInputFile(pdf_buffer.read(), filename=f"OSINT_PRO_{inn}_v2.8.pdf"),
+            caption="✅ Подробный профессиональный отчёт OSINT PRO v2.8"
         )
     except Exception as e:
         logger.error(f"PDF error INN {inn}", exc_info=True)
@@ -567,11 +529,7 @@ async def send_pdf(call: CallbackQuery):
 @dp.callback_query(F.data == "buy")
 async def buy_subscription(call: CallbackQuery):
     await call.answer()
-    await call.message.answer(
-        f"💰 **Подписка OSINT PRO**\n\n"
-        f"Безлимит + премиум-отчёты — {SUBSCRIPTION_PRICE}\n\n"
-        f"После оплаты напишите @ваш_логин с чеком — сразу активирую подписку."
-    )
+    await call.message.answer(f"💰 **Подписка OSINT PRO**\n\nБезлимит + премиум-отчёты — {SUBSCRIPTION_PRICE}\n\nПосле оплаты напишите @ваш_логин с чеком.")
 
 # ================= WEBHOOK & MAIN =================
 async def health_handler(request):
@@ -591,7 +549,7 @@ async def main():
     await init_db()
     await bot.delete_webhook(drop_pending_updates=True)
     await bot.set_webhook(url=WEBHOOK_URL)
-    logger.info("🚀 OSINT PRO v2.7 запущен с системой подписки!")
+    logger.info("🚀 OSINT PRO v2.8 запущен с Checko.ru!")
     app = web.Application()
     app.router.add_get("/", health_handler)
     app.router.add_post("/webhook", webhook_handler)
