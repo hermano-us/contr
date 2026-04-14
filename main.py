@@ -90,16 +90,29 @@ def log_to_sheet(user_id, inn, score: int):
         worksheet = sh.sheet1
         now = datetime.now()
         worksheet.append_row([
-            now.strftime("%d.%m.%Y %H:%M:%S"),   # Дата
-            str(user_id),                         # Пользователь (chat_id)
-            inn,                                  # ИНН/ОГРН
-            f"score:{score}",                     # Статус
-            "Бесплатный",                         # Тип отчёта
-            now.strftime("%H:%M:%S")              # Время обработки
+            now.strftime("%d.%m.%Y %H:%M:%S"),
+            str(user_id),
+            inn,
+            f"score:{score}",
+            "Бесплатный",
+            now.strftime("%H:%M:%S")
         ])
         logger.info(f"✅ Запись в Google Sheets: {user_id} | {inn} | score:{score}")
     except Exception as e:
         logger.error(f"Sheet write error: {e}")
+
+# ================= HELPERS =================
+def calculate_age(reg_date_str: str) -> str:
+    if not reg_date_str:
+        return "Н/Д"
+    try:
+        reg_date = datetime.strptime(reg_date_str, '%Y-%m-%d')
+        delta = datetime.now() - reg_date
+        years = delta.days // 365
+        months = (delta.days % 365) // 30
+        return f"{reg_date.strftime('%d.%m.%Y')} ({years} лет {months} мес.)"
+    except:
+        return reg_date_str
 
 # ================= RISK + PDF =================
 def get_risk_assessment(data: dict):
@@ -119,7 +132,6 @@ def get_risk_assessment(data: dict):
         except:
             pass
 
-    # Новый API не имеет status/status_text, но оставляем на будущее
     status = str(data.get('status') or data.get('status_text') or data.get('sv_status_msg', '')).lower()
     if any(x in status for x in ["ликвидац", "банкрот", "прекращ"]):
         score -= 80
@@ -132,6 +144,7 @@ def get_risk_assessment(data: dict):
     return score, risk_factors, color
 
 def create_pro_pdf(data: dict, score: int, risks: list, color: colors):
+    # (оставил без изменений — PDF остаётся полным)
     buffer = BytesIO()
     c = canvas.Canvas(buffer, pagesize=A4)
     w, h = A4
@@ -154,13 +167,7 @@ def create_pro_pdf(data: dict, score: int, risks: list, color: colors):
     c.setFont(FONT_NAME, 16)
     c.drawString(270, h - 165, f"{score} / 100")
 
-    # Исправлено: теперь берём правильное название компании
-    company_name = (
-        data.get('short_name') or 
-        data.get('full_name') or 
-        data.get('name') or 
-        "Н/Д"
-    )
+    company_name = data.get('short_name') or data.get('full_name') or data.get('name') or "Н/Д"
 
     y = h - 220
     info = [
@@ -228,19 +235,36 @@ async def handle_search(message: Message):
 
     await log_usage(message.from_user.id)
     score, risks, color = get_risk_assessment(data)
-
-    # Исправлено логирование в Google Sheets
     log_to_sheet(message.from_user.id, inn, score)
 
-    # Исправлено: теперь название компании всегда подтягивается
+    # === Формирование Варианта А ===
     company_name = data.get('short_name') or data.get('full_name') or data.get('name') or '—'
+    inn_val = data.get('inn', inn)
+    ogrn = data.get('ogrn', 'Н/Д')
+    kpp = data.get('kpp', 'Н/Д')
+    status = data.get('status_text') or data.get('status') or data.get('sv_status_msg', "Действует")
+    reg_date_str = data.get('reg_date', '')
+    age = calculate_age(reg_date_str)
+    director = data.get('director') or data.get('head_name') or data.get('ceo') or data.get('manager') or "Н/Д"
+    address = data.get('address', "Информация ограничена")[:120]
 
     res = (
-        f"✅ **ОТЧЁТ OSINT PRO**\n\n"
+        f"✅ **OSINT PRO**\n\n"
         f"🏢 `{company_name}`\n"
-        f"🛡️ Индекс безопасности: `{score}/100`\n"
-        f"📄 Полный аудит в PDF ниже."
+        f"📋 ИНН `{inn_val}` | ОГРН `{ogrn}` | КПП `{kpp}`\n\n"
+        f"📅 Зарегистрирована {age}\n"
+        f"👤 Директор: {director}\n"
+        f"📍 {address}\n\n"
+        f"🛡️ Индекс безопасности: `{score}/100`\n\n"
     )
+
+    if risks:
+        res += "⚠️ **Основные риски:**\n"
+        for risk in risks[:3]:
+            res += f"• {risk}\n"
+        res += "\n"
+
+    res += "📄 Полный отчёт в PDF"
 
     kb = InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="📥 Скачать PDF", callback_data=f"pdf_{inn}")
@@ -253,14 +277,11 @@ async def handle_search(message: Message):
 async def send_pdf(call: CallbackQuery):
     inn = call.data.split("_")[1]
     await call.answer("Генерирую PDF...")
-
     async with aiohttp.ClientSession() as session:
         async with session.get(f"https://egrul.org/short_data/?id={inn}") as resp:
             data = await resp.json(content_type=None)
-
     score, risks, color = get_risk_assessment(data)
     pdf_buffer = create_pro_pdf(data, score, risks, color)
-
     await call.message.answer_document(
         BufferedInputFile(pdf_buffer.read(), filename=f"OSINT_PRO_{inn}.pdf"),
         caption="✅ Аналитический отчёт готов"
