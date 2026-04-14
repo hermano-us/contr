@@ -271,11 +271,17 @@ async def webhook_handler(request):
     try:
         data = await request.json()
         update = Update.model_validate(data)
-        await bot.process_new_updates([update])
-        return web.Response()
+        
+        # ← Вот эта строка была главной ошибкой
+        await dp.feed_update(bot=bot, update=update)
+        logger.info(f"Получен update от пользователя {update.message.from_user.id if update.message else '—'}")
+        
+        return web.Response(text="OK", status=200)
+    
     except Exception as e:
         logger.error(f"Webhook error: {e}")
-        return web.Response(status=500)
+        # Важно: Telegramу всегда возвращаем 200, иначе он будет спамить ретраями
+        return web.Response(text="OK", status=200)
 
 async def main():
     await init_db()
