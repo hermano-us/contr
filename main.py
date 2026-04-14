@@ -19,12 +19,14 @@ from reportlab.pdfgen import canvas
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.lib import colors
+
 # ================= CONFIG =================
 TOKEN = os.environ.get("TOKEN")
 ADMIN_CHAT_ID = int(os.environ.get("ADMIN_CHAT_ID", 0))
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL")
 GOOGLE_CREDENTIALS = os.environ.get("GOOGLE_CREDENTIALS")
 SHEET_ID = os.environ.get("SHEET_ID")
+CHECKO_API_KEY = os.environ.get("CHECKO_API_KEY")
 DB_NAME = "osint_pro.db"
 FREE_LIMIT = 3
 
@@ -34,13 +36,18 @@ logger = logging.getLogger(__name__)
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
+if CHECKO_API_KEY:
+    logger.info("✅ Checko API подключён")
+else:
+    logger.warning("⚠️ CHECKO_API_KEY не задан — арбитраж отключён")
+
 # ================= FONT =================
 FONT_NAME = "DejaVuSans"
 try:
     pdfmetrics.registerFont(TTFont(FONT_NAME, "DejaVuSans.ttf"))
     logger.info("✅ Шрифт DejaVuSans загружен")
 except Exception:
-    logger.warning("Шрифт DejaVuSans не найден → будет Helvetica")
+    logger.warning("Шрифт DejaVuSans не найден → Helvetica")
     FONT_NAME = "Helvetica"
 
 # ================= DATABASE =================
@@ -51,7 +58,6 @@ async def init_db():
         await db.commit()
 
 async def check_limit(user_id: int) -> tuple[bool, int]:
-    """Возвращает (можно_использовать, осталось_запросов)"""
     try:
         async with aiosqlite.connect(DB_NAME) as db:
             today = date.today().isoformat()
@@ -112,19 +118,42 @@ def calculate_age(reg_date_str: str) -> str:
         delta = datetime.now() - reg_date
         years = delta.days // 365
         months = (delta.days % 365) // 30
-        days = (delta.days % 365) % 30
-        if years == 0 and months == 0:
-            return f"{reg_date.strftime('%d.%m.%Y')} (новая компания)"
-        return f"{reg_date.strftime('%d.%m.%Y')} ({years} лет {months} мес. {days} дн.)"
+        return f"{reg_date.strftime('%d.%m.%Y')} ({years} лет {months} мес.)"
     except:
         return reg_date_str
 
-def get_risk_assessment(data: dict):
+def get_company_status(data: dict) -> tuple[str, str]:
+    status = str(data.get('status_text') or data.get('status') or data.get('sv_status_msg') or "Действует").lower()
+    if any(word in status for word in ["ликвидац", "прекращ", "ликвидирован"]):
+        return "В процессе ликвидации / ликвидирована", "🚨"
+    if any(word in status for word in ["банкрот", "банкротство"]):
+        return "В процедуре банкротства", "❌"
+    if any(word in status for word in ["недейств", "исключен"]):
+        return "Недействующий статус", "⚠️"
+    return "Действует", "✅"
+
+async def get_arbitration_data(inn: str) -> dict | None:
+    if not CHECKO_API_KEY:
+        return None
+    try:
+        async with aiohttp.ClientSession() as session:
+            url = f"https://api.checko.ru/v2/legal-cases"
+            params = {"key": CHECKO_API_KEY, "inn": inn}
+            async with session.get(url, params=params, timeout=8) as resp:
+                if resp.status != 200:
+                    return None
+                return await resp.json()
+    except Exception as e:
+        logger.error(f"Arbitration error: {e}")
+        return None
+
+def get_risk_assessment(data: dict, arbitration_data: dict | None = None):
     score = 100
     risk_factors = []
-    warnings = []  # для блока "Критические предупреждения"
+    warnings = []
+    mass_flags = []
 
-    # 1. Возраст компании
+    # Возраст
     reg_date_str = data.get('reg_date', '')
     if reg_date_str:
         try:
@@ -142,135 +171,202 @@ def get_risk_assessment(data: dict):
         except:
             pass
 
-    # 2. Флаги недостоверности (самые важные!)
+    # Массовость и недостоверность
     if data.get('invalid_address') == 1:
         score -= 40
-        risk_factors.append("🚨 Недостоверный адрес регистрации")
-        warnings.append(data.get('invalid_address_msg', 'Недостоверный адрес'))
+        risk_factors.append("🚨 Недостоверный / массовый адрес")
+        warnings.append(data.get('invalid_address_msg', 'Массовый адрес'))
+        mass_flags.append("Адрес")
     if data.get('invalid_founder') == 1:
         score -= 35
-        risk_factors.append("🚨 Недостоверные сведения об учредителях")
-        warnings.append(data.get('invalid_founder_msg', 'Недостоверные учредители'))
+        risk_factors.append("🚨 Недостоверные / массовые учредители")
+        warnings.append(data.get('invalid_founder_msg', 'Массовые учредители'))
+        mass_flags.append("Учредители")
     if data.get('invalid_chief') == 1:
         score -= 40
-        risk_factors.append("🚨 Недостоверный руководитель")
-        warnings.append(data.get('invalid_chief_msg', 'Недостоверный руководитель'))
+        risk_factors.append("🚨 Недостоверный / массовый руководитель")
+        warnings.append(data.get('invalid_chief_msg', 'Массовый руководитель'))
+        mass_flags.append("Руководитель")
 
-    # 3. Статус
-    status = str(data.get('status') or data.get('status_text') or data.get('sv_status_msg', '')).lower()
-    if any(x in status for x in ["ликвидац", "банкрот", "прекращ", "недейств"]):
+    # Статус
+    status_lower = str(data.get('status') or data.get('status_text') or data.get('sv_status_msg', '')).lower()
+    if any(x in status_lower for x in ["ликвидац", "банкрот", "прекращ", "недейств"]):
         score -= 80
         risk_factors.append("🚨 ОПАСНО: ликвидация / банкротство / недействующий статус")
 
-    # 4. Дополнительные предупреждения
-    sv_msg = data.get('sv_status_msg', '')
-    if sv_msg and "следует обратить внимание" in sv_msg:
-        score -= 20
-        risk_factors.append("🟠 Есть особые сведения в ЕГРЮЛ")
+    # Арбитраж
+    arb_count = 0
+    if arbitration_data and isinstance(arbitration_data, dict):
+        arb_count = arbitration_data.get("total", 0) or len(arbitration_data.get("cases", []))
+        if arb_count > 0:
+            score -= min(45, arb_count * 8)
+            risk_factors.append(f"⚖️ Арбитражные дела: {arb_count} шт.")
 
-    # Финализация
     if score > 85 and not risk_factors:
         risk_factors.append("✅ Критических рисков не обнаружено")
-    
+
     color = colors.green if score > 75 else colors.orange if score > 45 else colors.red
-    
-    recommendation = {
-        score > 80: "✅ Рекомендуется к работе",
-        60 <= score <= 80: "🟡 Требует дополнительной проверки",
-        score < 60: "🚫 Высокий риск! Не рекомендуется"
-    }[True]
+    recommendation = "✅ Рекомендуется к работе" if score > 80 else "🟡 Требует дополнительной проверки" if score >= 60 else "🚫 Высокий риск! Не рекомендуется"
 
-    return score, risk_factors, warnings, color, recommendation
+    return score, risk_factors, warnings, color, recommendation, arbitration_data, mass_flags
 
-def create_pro_pdf(data: dict, score: int, risks: list, warnings: list, color: colors):
+# ================= УЛУЧШЕННЫЙ PDF =================
+def draw_multiline(c, x, y, text, font_size=10, max_width=480, line_height=14):
+    """Простая обёртка длинного текста"""
+    if not text:
+        return y
+    words = str(text).split()
+    line = ""
+    for word in words:
+        if c.stringWidth(line + word + " ", FONT_NAME, font_size) > max_width:
+            c.drawString(x, y, line)
+            y -= line_height
+            line = word + " "
+        else:
+            line += word + " "
+    if line:
+        c.drawString(x, y, line)
+        y -= line_height
+    return y
+
+def create_pro_pdf(data: dict, score: int, risks: list, warnings: list, color: colors, 
+                   arbitration_data: dict | None, mass_flags: list):
     buffer = BytesIO()
     c = canvas.Canvas(buffer, pagesize=A4)
     w, h = A4
+    y = h - 70
 
-    # Header
-    c.setFillColor(colors.HexColor("#f4f4f4"))
-    c.rect(0, h - 100, w, 100, fill=1, stroke=0)
+    # HEADER
     c.setFillColor(colors.HexColor("#1a237e"))
     c.setFont(FONT_NAME, 26)
-    c.drawString(50, h - 60, "АНАЛИТИЧЕСКИЙ ОТЧЁТ OSINT PRO v2.1")
-    c.setFont(FONT_NAME, 10)
+    c.drawString(50, y, "OSINT PRO v2.4")
+    c.setFont(FONT_NAME, 11)
     c.setFillColor(colors.grey)
-    c.drawString(50, h - 82, f"Сформировано: {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}")
+    c.drawString(50, y - 22, f"Аналитический отчёт • {datetime.now().strftime('%d.%m.%Y %H:%M')}")
+    y -= 70
 
-    # Индекс безопасности
+    # ИНДЕКС БЕЗОПАСНОСТИ
     c.setFont(FONT_NAME, 14)
     c.setFillColor(colors.black)
-    c.drawString(50, h - 140, "ИНДЕКС БЕЗОПАСНОСТИ:")
+    c.drawString(50, y, "ИНДЕКС БЕЗОПАСНОСТИ")
     c.setStrokeColor(colors.lightgrey)
-    c.roundRect(50, h - 170, 220, 22, 6, stroke=1, fill=0)
+    c.roundRect(50, y - 32, 240, 28, 8, stroke=1, fill=0)
     c.setFillColor(color)
-    c.roundRect(50, h - 170, 2.2 * score, 22, 6, stroke=0, fill=1)
+    c.roundRect(50, y - 32, 2.4 * score, 28, 8, stroke=0, fill=1)
     c.setFillColor(colors.black)
-    c.setFont(FONT_NAME, 18)
-    c.drawString(290, h - 165, f"{score} / 100")
+    c.setFont(FONT_NAME, 22)
+    c.drawString(310, y - 25, f"{score} / 100")
+    y -= 80
 
-    # Основная информация
+    # СТАТУС
+    status_text, status_emoji = get_company_status(data)
+    c.setFont(FONT_NAME, 15)
+    c.setFillColor(colors.black)
+    c.drawString(50, y, "Статус компании")
+    c.setFillColor(colors.red if "ликвидац" in status_text.lower() or "банкрот" in status_text.lower() else colors.green)
+    c.drawString(220, y, f"{status_emoji} {status_text}")
+    y -= 45
+
+    # РЕКВИЗИТЫ
+    c.setFont(FONT_NAME, 13)
+    c.setFillColor(colors.black)
+    c.drawString(50, y, "Основные реквизиты")
+    y -= 25
+    c.setFont(FONT_NAME, 10)
+    c.setFillColor(colors.grey)
+
     company_name = data.get('short_name') or data.get('full_name') or data.get('name') or "Н/Д"
-    y = h - 230
+    director = f"{data.get('chief_position', '')} {data.get('chief', 'Н/Д')}".strip() or "Н/Д"
 
-    info = [
-        ("Организация:", company_name),
-        ("ИНН:", data.get('inn', "Н/Д")),
-        ("ОГРН:", data.get('ogrn', "Н/Д")),
-        ("КПП:", data.get('kpp', "Н/Д")),
-        ("Статус:", data.get('status_text') or data.get('status') or data.get('sv_status_msg', "Действует")),
-        ("Дата регистрации:", data.get('reg_date', "Н/Д")),
-        ("Руководитель:", f"{data.get('chief_position', '')} {data.get('chief', 'Н/Д')}".strip()),
-        ("Адрес:", data.get('address', "Информация ограничена")[:130])
+    fields = [
+        ("Полное наименование", company_name),
+        ("ИНН", data.get('inn', "Н/Д")),
+        ("ОГРН", data.get('ogrn', "Н/Д")),
+        ("КПП", data.get('kpp', "Н/Д")),
+        ("Руководитель", director),
+        ("Дата регистрации", data.get('reg_date', "Н/Д")),
+        ("Адрес", data.get('address', "Информация ограничена"))
     ]
 
-    for label, val in info:
-        c.setFont(FONT_NAME, 11)
-        c.setFillColor(colors.grey)
-        c.drawString(50, y, label)
-        c.setFillColor(colors.black)
-        c.drawString(190, y, str(val))
-        y -= 26
+    for label, value in fields:
+        c.drawString(50, y, label + ":")
+        y = draw_multiline(c, 210, y, value, font_size=10, max_width=340)
+        y -= 8
 
-    # Критические предупреждения
-    if warnings:
-        y -= 20
-        c.setStrokeColor(colors.red)
-        c.line(50, y, 550, y)
+    y -= 20
+
+    # МАССОВОСТЬ
+    if mass_flags:
+        c.setFont(FONT_NAME, 13)
+        c.setFillColor(colors.orange)
+        c.drawString(50, y, "⚠️ Массовость сведений ЕГРЮЛ")
+        y -= 22
+        c.setFont(FONT_NAME, 10)
+        c.setFillColor(colors.black)
+        c.drawString(60, y, f"Обнаружена массовость по: {', '.join(mass_flags)}")
         y -= 30
+
+    # ПРЕДУПРЕЖДЕНИЯ
+    if warnings:
         c.setFont(FONT_NAME, 13)
         c.setFillColor(colors.red)
-        c.drawString(50, y, "🚨 КРИТИЧЕСКИЕ ПРЕДУПРЕЖДЕНИЯ ЕГРЮЛ:")
-        y -= 25
+        c.drawString(50, y, "🚨 Критические предупреждения ЕГРЮЛ")
+        y -= 22
         c.setFont(FONT_NAME, 10)
         c.setFillColor(colors.black)
         for w in warnings:
-            c.drawString(60, y, f"• {w}")
-            y -= 22
+            y = draw_multiline(c, 60, y, f"• {w}", max_width=480)
+        y -= 15
 
-    # Заключение
+    # АРБИТРАЖ
+    if arbitration_data and isinstance(arbitration_data, dict):
+        arb_count = arbitration_data.get("total", 0) or len(arbitration_data.get("cases", []))
+        if arb_count > 0:
+            c.setFont(FONT_NAME, 13)
+            c.setFillColor(colors.red)
+            c.drawString(50, y, f"⚖️ Арбитражные дела — {arb_count} шт.")
+            y -= 30
+
+    # ЗАКЛЮЧЕНИЕ И РИСКИ
+    c.setFont(FONT_NAME, 13)
+    c.setFillColor(colors.black)
+    c.drawString(50, y, "Заключение экспертизы и риски")
+    y -= 25
+    c.setFont(FONT_NAME, 10)
+    c.setFillColor(colors.black)
+    for risk in risks:
+        y = draw_multiline(c, 60, y, f"• {risk}", max_width=480)
+        y -= 4
+
+    # РЕКОМЕНДАЦИЯ (большой блок)
     y -= 20
     c.setFont(FONT_NAME, 14)
+    c.setFillColor(color)
+    c.drawString(50, y, "РЕКОМЕНДАЦИЯ OSINT PRO")
+    y -= 22
+    c.setFont(FONT_NAME, 11)
     c.setFillColor(colors.black)
-    c.drawString(50, y, "ЗАКЛЮЧЕНИЕ ЭКСПЕРТИЗЫ:")
-    y -= 30
-    c.setFont(FONT_NAME, 10)
-    for risk in risks:
-        c.drawString(60, y, risk)
-        y -= 22
+    c.drawString(60, y, recommendation)
+    y -= 40
+
+    # FOOTER
+    c.setFont(FONT_NAME, 8)
+    c.setFillColor(colors.grey)
+    c.drawString(50, 40, f"OSINT PRO v2.4 • Источники: ЕГРЮЛ, Checko.ru • {datetime.now().strftime('%d.%m.%Y')}")
+    c.drawString(400, 40, "Конфиденциально")
 
     c.showPage()
     c.save()
     buffer.seek(0)
     return buffer
 
-# ================= HANDLERS =================
+# ================= HANDLERS (обновлённые) =================
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
     await message.answer(
-        "🚀 **OSINT PRO v2.1**\n\n"
-        "Пришлите ИНН или ОГРН (10 или 12 цифр) для глубокого анализа компании.\n"
-        "Бесплатно — 3 запроса в сутки.",
+        "🚀 **OSINT PRO v2.4**\n\n"
+        "Пришлите ИНН или ОГРН.\n"
+        "Полный профессиональный отчёт с массовостью, арбитражем и расширенным PDF.",
         parse_mode=ParseMode.MARKDOWN
     )
 
@@ -282,33 +378,35 @@ async def handle_search(message: Message):
 
     can_use, remaining = await check_limit(message.from_user.id)
     if not can_use:
-        kb = InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text="💰 Купить подписку", callback_data="buy")
-        ]])
+        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="💰 Купить подписку", callback_data="buy")]])
         return await message.answer("🛑 Лимит 3 запроса в день исчерпан.", reply_markup=kb)
 
-    wait = await message.answer("🔍 Идёт глубокий анализ по реестрам ЕГРЮЛ...")
+    wait = await message.answer("🔍 Глубокий анализ ЕГРЮЛ + арбитраж...")
 
     async with aiohttp.ClientSession() as session:
-        async with session.get(f"https://egrul.org/short_data/?id={inn}") as resp:
-            data = await resp.json(content_type=None) if resp.status == 200 else None
+        egrul_task = session.get(f"https://egrul.org/short_data/?id={inn}")
+        arb_task = get_arbitration_data(inn) if CHECKO_API_KEY else asyncio.sleep(0)
+
+        egrul_resp = await egrul_task
+        data = await egrul_resp.json(content_type=None) if egrul_resp.status == 200 else None
+        arbitration_data = await arb_task if CHECKO_API_KEY else None
 
     if not data or not isinstance(data, dict):
-        return await wait.edit_text("❌ Данные по ИНН не найдены в ЕГРЮЛ.")
+        return await wait.edit_text("❌ Данные по ИНН не найдены.")
 
     await log_usage(message.from_user.id)
-    score, risks, warnings, color, recommendation = get_risk_assessment(data)
-
+    score, risks, warnings, color, recommendation, arbitration_data, mass_flags = get_risk_assessment(data, arbitration_data)
     log_to_sheet(message.from_user.id, inn, score)
 
-    # Формирование улучшенного отчёта
+    status_text, status_emoji = get_company_status(data)
     company_name = data.get('short_name') or data.get('full_name') or data.get('name') or '—'
     director_info = f"{data.get('chief_position', '')} {data.get('chief', 'Н/Д')}".strip() or "Н/Д"
 
     res = (
-        f"✅ **OSINT PRO v2.1**\n\n"
+        f"✅ **OSINT PRO v2.4**\n\n"
         f"🏢 `{company_name}`\n"
         f"📋 ИНН `{data.get('inn', inn)}` | ОГРН `{data.get('ogrn', 'Н/Д')}` | КПП `{data.get('kpp', 'Н/Д')}`\n\n"
+        f"📌 **Статус:** {status_emoji} {status_text}\n"
         f"📅 Зарегистрирована {calculate_age(data.get('reg_date', ''))}\n"
         f"👤 Руководитель: {director_info}\n"
         f"📍 {data.get('address', 'Информация ограничена')[:140]}\n\n"
@@ -317,17 +415,16 @@ async def handle_search(message: Message):
         f"Осталось бесплатных запросов сегодня: **{remaining}/3**\n\n"
     )
 
-    if risks:
-        res += "⚠️ **Основные риски:**\n"
-        for risk in risks[:5]:
-            res += f"• {risk}\n"
-        res += "\n"
+    if mass_flags:
+        res += f"⚠️ **Массовость:** по {', '.join(mass_flags)}\n"
+    if arbitration_data:
+        arb_count = arbitration_data.get("total", 0) or len(arbitration_data.get("cases", []))
+        if arb_count > 0:
+            res += f"⚖️ **Арбитраж:** {arb_count} дел\n"
 
-    res += "📄 Полный профессиональный отчёт в PDF"
+    res += "\n📄 **Полный профессиональный отчёт в PDF**"
 
-    kb = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="📥 Скачать PDF", callback_data=f"pdf_{inn}")
-    ]])
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="📥 Скачать PDF", callback_data=f"pdf_{inn}")]])
 
     await wait.delete()
     await message.answer(res, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
@@ -335,18 +432,19 @@ async def handle_search(message: Message):
 @dp.callback_query(F.data.startswith("pdf_"))
 async def send_pdf(call: CallbackQuery):
     inn = call.data.split("_")[1]
-    await call.answer("Генерирую подробный PDF...")
+    await call.answer("Генерирую подробный PDF-отчёт...")
 
     async with aiohttp.ClientSession() as session:
         async with session.get(f"https://egrul.org/short_data/?id={inn}") as resp:
             data = await resp.json(content_type=None)
 
-    score, risks, warnings, color, _ = get_risk_assessment(data)
-    pdf_buffer = create_pro_pdf(data, score, risks, warnings, color)
+    arbitration_data = await get_arbitration_data(inn) if CHECKO_API_KEY else None
+    score, risks, warnings, color, _, arbitration_data, mass_flags = get_risk_assessment(data, arbitration_data)
+    pdf_buffer = create_pro_pdf(data, score, risks, warnings, color, arbitration_data, mass_flags)
 
     await call.message.answer_document(
         BufferedInputFile(pdf_buffer.read(), filename=f"OSINT_PRO_{inn}.pdf"),
-        caption="✅ Полный аналитический отчёт OSINT PRO v2.1"
+        caption="✅ Подробный аналитический отчёт OSINT PRO v2.4"
     )
 
 @dp.callback_query(F.data == "buy")
@@ -367,7 +465,6 @@ async def webhook_handler(request):
         data = await request.json()
         update = Update.model_validate(data)
         await dp.feed_update(bot=bot, update=update)
-        logger.info(f"✅ Update обработан (update_id={update.update_id})")
         return web.Response(text="OK", status=200)
     except Exception as e:
         logger.error(f"Webhook error: {e}")
@@ -389,7 +486,7 @@ async def main():
     site = web.TCPSite(runner, '0.0.0.0', int(os.environ.get("PORT", 10000)))
     await site.start()
 
-    logger.info("🚀 OSINT PRO v2.1 запущен успешно! (усиленная аналитика)")
+    logger.info("🚀 OSINT PRO v2.4 запущен! (профессиональный PDF)")
     await asyncio.Event().wait()
 
 if __name__ == "__main__":
