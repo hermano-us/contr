@@ -49,22 +49,22 @@ else:
 # ================= DATABASE =================
 async def init_db():
     async with aiosqlite.connect(DB_NAME) as db:
-        # Основная таблица логов (с миграцией для новых колонок)
+        # Основная таблица логов (с миграцией)
         await db.execute('''CREATE TABLE IF NOT EXISTS usage_log 
                             (user_id INTEGER, query_date DATE DEFAULT CURRENT_DATE)''')
         try:
             await db.execute("ALTER TABLE usage_log ADD COLUMN inn TEXT")
         except Exception:
-            pass  # колонка уже существует
+            pass
         try:
             await db.execute("ALTER TABLE usage_log ADD COLUMN score INTEGER DEFAULT 0")
         except Exception:
-            pass  # колонка уже существует
+            pass
 
         await db.execute('''CREATE TABLE IF NOT EXISTS subscriptions 
                             (user_id INTEGER PRIMARY KEY, until_date DATE)''')
 
-        # Новый кэш (TTL 1 час)
+        # Кэш (TTL 1 час)
         await db.execute('''CREATE TABLE IF NOT EXISTS cache (
                             inn TEXT PRIMARY KEY,
                             data TEXT,
@@ -107,6 +107,7 @@ async def log_usage(user_id: int, inn: str, score: int, is_premium: bool):
     if is_premium:
         logger.info(f"Платный запрос от {user_id} по ИНН {inn} (score: {score})")
 
+# ================= ADMIN FUNCTIONS =================
 async def grant_subscription(user_id: int, days: int):
     until = (date.today() + timedelta(days=days)).isoformat()
     async with aiosqlite.connect(DB_NAME) as db:
@@ -118,9 +119,26 @@ async def revoke_subscription(user_id: int):
         await db.execute("DELETE FROM subscriptions WHERE user_id = ?", (user_id,))
         await db.commit()
 
+async def get_stats() -> str:
+    try:
+        async with aiosqlite.connect(DB_NAME) as db:
+            async with db.execute("SELECT COUNT(DISTINCT user_id) FROM usage_log") as cur:
+                total_users = (await cur.fetchone())[0] or 0
+            async with db.execute("SELECT COUNT(*) FROM usage_log WHERE query_date = ?", (date.today().isoformat(),)) as cur:
+                today_queries = (await cur.fetchone())[0] or 0
+            async with db.execute("SELECT COUNT(*) FROM subscriptions WHERE until_date >= ?", (date.today().isoformat(),)) as cur:
+                active_subs = (await cur.fetchone())[0] or 0
+        return (f"📊 **Статистика OSINT PRO**\n\n"
+                f"👥 Всего уникальных пользователей: {total_users}\n"
+                f"🔥 Запросов сегодня: {today_queries}\n"
+                f"💎 Активных подписок: {active_subs}\n"
+                f"🕒 Сейчас: {datetime.now().strftime('%d.%m.%Y %H:%M')}")
+    except Exception as e:
+        logger.error(f"Stats error: {e}")
+        return "❌ Ошибка получения статистики"
+
 # ================= CACHE =================
 async def get_from_cache(inn: str) -> tuple[dict | None, dict | None, str | None]:
-    """Возвращает (data, arbitration_data, cached_at) если кэш свежий (TTL 1 час)"""
     try:
         async with aiosqlite.connect(DB_NAME) as db:
             async with db.execute(
@@ -157,13 +175,11 @@ async def save_to_cache(inn: str, data: dict | None, arbitration_data: dict | No
         logger.error(f"Cache save error: {e}")
 
 async def get_company_data(inn: str, force_refresh: bool = False) -> tuple[dict | None, dict | None, str | None]:
-    """Единая точка получения данных: кэш → Checko → ЕГРЮЛ fallback + сохранение в кэш"""
     if not force_refresh:
         cached_data, cached_arb, cached_at = await get_from_cache(inn)
         if cached_data:
             return cached_data, cached_arb, cached_at
 
-    # Свежие данные
     checko_data = await get_checko_company(inn)
     data = checko_data if checko_data else await get_egrul_data(inn)
     arbitration_data = await get_arbitration_data(inn) if CHECKO_API_KEY else None
@@ -283,7 +299,6 @@ def get_risk_assessment(data: dict, arbitration_data: dict | None = None):
     recommendation = "✅ Рекомендуется к работе" if score > 80 else "🟡 Требует дополнительной проверки" if score >= 60 else "🚫 Высокий риск!"
     return score, risk_factors, warnings, color, recommendation, arbitration_data, mass_flags
 
-# Новые безопасные хелперы (устойчивость к изменениям API Checko)
 def is_individual_entrepreneur(data: dict) -> bool:
     if not data:
         return False
@@ -311,7 +326,7 @@ def safe_get_founders_count(data: dict) -> int:
     org = len(uch.get("РосОрг", [])) if isinstance(uch.get("РосОрг"), list) else 0
     return fl + org
 
-# ================= PDF v2.8 (улучшено) =================
+# ================= PDF v2.8 =================
 def draw_multiline(c, x, y, text, font_size=10, max_width=480, line_height=14):
     if not text:
         return y
@@ -374,7 +389,7 @@ def create_pro_pdf(data: dict, score: int, risks: list, warnings: list, color: c
     c.drawString(220, y, f"{status_emoji} {status_text}")
     y -= 45
 
-    # КЛЮЧЕВЫЕ ФАКТЫ (улучшенный табличный вид + поддержка ИП)
+    # КЛЮЧЕВЫЕ ФАКТЫ
     c.setFont(FONT_NAME, 13)
     c.setFillColor(colors.black)
     c.drawString(50, y, "Ключевые факты")
@@ -412,7 +427,7 @@ def create_pro_pdf(data: dict, score: int, risks: list, warnings: list, color: c
         y -= 8
     y -= 25
 
-    # === КОНТАКТЫ (уже исправлено ранее) ===
+    # КОНТАКТЫ
     contacts = data.get("Контакты") or []
     if isinstance(contacts, dict):
         flat = []
@@ -489,7 +504,7 @@ def create_pro_pdf(data: dict, score: int, risks: list, warnings: list, color: c
     c.setFillColor(colors.black)
     c.drawString(60, y, recommendation)
 
-    # ФУТЕР + информация о кэше
+    # ФУТЕР
     c.setFont(FONT_NAME, 8)
     c.setFillColor(colors.grey)
     footer = f"OSINT PRO v2.8 • Checko.ru + ЕГРЮЛ"
@@ -532,14 +547,49 @@ def log_to_sheet(user_id, inn, score: int):
 # ================= HANDLERS =================
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
-    await message.answer(
-        "🚀 **OSINT PRO v2.8**\n\n"
-        "Полный анализ компаний и **ИП** из Checko.ru + ЕГРЮЛ\n"
-        "✅ Кэширование данных (1 час)\n"
-        "📖 /history — ваша история запросов\n\n"
-        "Пришлите ИНН или ОГРН (10 или 12 цифр)",
-        parse_mode=ParseMode.MARKDOWN
-    )
+    is_admin = message.from_user.id == ADMIN_CHAT_ID
+    text = "🚀 **OSINT PRO v2.8**\n\nПолный анализ компаний и ИП из Checko.ru + ЕГРЮЛ\n✅ Кэширование • История • Обновление данных\n\nПришлите ИНН или ОГРН"
+    if is_admin:
+        text += "\n\n👑 **Админ-панель:**\n/grant <user_id> <дней>\n/revoke <user_id>\n/stats\n/pricing"
+    await message.answer(text, parse_mode=ParseMode.MARKDOWN)
+
+@dp.message(Command("grant"))
+async def cmd_grant(message: Message):
+    if message.from_user.id != ADMIN_CHAT_ID:
+        return await message.answer("⛔️ Доступ запрещён.")
+    try:
+        _, user_id_str, days_str = message.text.split()
+        user_id = int(user_id_str)
+        days = int(days_str)
+        await grant_subscription(user_id, days)
+        await message.answer(f"✅ Подписка выдана пользователю {user_id} на {days} дней")
+    except:
+        await message.answer("❌ Формат: /grant <user_id> <дней>")
+
+@dp.message(Command("revoke"))
+async def cmd_revoke(message: Message):
+    if message.from_user.id != ADMIN_CHAT_ID:
+        return await message.answer("⛔️ Доступ запрещён.")
+    try:
+        _, user_id_str = message.text.split()
+        user_id = int(user_id_str)
+        await revoke_subscription(user_id)
+        await message.answer(f"✅ Подписка отозвана у пользователя {user_id}")
+    except:
+        await message.answer("❌ Формат: /revoke <user_id>")
+
+@dp.message(Command("stats"))
+async def cmd_stats(message: Message):
+    if message.from_user.id != ADMIN_CHAT_ID:
+        return await message.answer("⛔️ Доступ запрещён.")
+    stats_text = await get_stats()
+    await message.answer(stats_text, parse_mode=ParseMode.MARKDOWN)
+
+@dp.message(Command("pricing"))
+async def cmd_pricing(message: Message):
+    if message.from_user.id != ADMIN_CHAT_ID:
+        return await message.answer("⛔️ Доступ запрещён.")
+    await message.answer(f"💰 **Текущая цена подписки**\n\n{SUBSCRIPTION_PRICE}\n\nБезлимит + премиум-PDF")
 
 @dp.message(Command("history"))
 async def cmd_history(message: Message):
@@ -677,7 +727,7 @@ async def main():
     await init_db()
     await bot.delete_webhook(drop_pending_updates=True)
     await bot.set_webhook(url=WEBHOOK_URL)
-    logger.info("🚀 OSINT PRO v2.8-fix запущен!")
+    logger.info("🚀 OSINT PRO v2.8-fix запущен с админ-панелью!")
     app = web.Application()
     app.router.add_get("/", health_handler)
     app.router.add_post("/webhook", webhook_handler)
