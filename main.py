@@ -43,11 +43,18 @@ else:
 
 # ================= FONT =================
 FONT_NAME = "DejaVuSans"
-try:
-    pdfmetrics.registerFont(TTFont(FONT_NAME, "DejaVuSans.ttf"))
-    logger.info("✅ Шрифт DejaVuSans загружен")
-except Exception:
-    logger.warning("Шрифт DejaVuSans не найден → Helvetica")
+FONT_PATH = "DejaVuSans.ttf"
+
+if os.path.exists(FONT_PATH):
+    try:
+        pdfmetrics.registerFont(TTFont(FONT_NAME, FONT_PATH))
+        logger.info("✅ Шрифт DejaVuSans загружен успешно")
+    except Exception as e:
+        logger.error(f"❌ Ошибка регистрации шрифта DejaVuSans: {e}")
+        FONT_NAME = "Helvetica"
+else:
+    logger.warning("⚠️ Файл DejaVuSans.ttf НЕ НАЙДЕН в корне проекта! "
+                   "PDF с русским текстом может падать. Загрузи шрифт на Render.com")
     FONT_NAME = "Helvetica"
 
 # ================= DATABASE =================
@@ -212,7 +219,6 @@ def get_risk_assessment(data: dict, arbitration_data: dict | None = None):
 
 # ================= УЛУЧШЕННЫЙ PDF =================
 def draw_multiline(c, x, y, text, font_size=10, max_width=480, line_height=14):
-    """Простая обёртка длинного текста"""
     if not text:
         return y
     words = str(text).split()
@@ -229,7 +235,7 @@ def draw_multiline(c, x, y, text, font_size=10, max_width=480, line_height=14):
         y -= line_height
     return y
 
-def create_pro_pdf(data: dict, score: int, risks: list, warnings: list, color: colors, 
+def create_pro_pdf(data: dict, score: int, risks: list, warnings: list, color: colors,
                    arbitration_data: dict | None, mass_flags: list):
     buffer = BytesIO()
     c = canvas.Canvas(buffer, pagesize=A4)
@@ -274,10 +280,8 @@ def create_pro_pdf(data: dict, score: int, risks: list, warnings: list, color: c
     y -= 25
     c.setFont(FONT_NAME, 10)
     c.setFillColor(colors.grey)
-
     company_name = data.get('short_name') or data.get('full_name') or data.get('name') or "Н/Д"
     director = f"{data.get('chief_position', '')} {data.get('chief', 'Н/Д')}".strip() or "Н/Д"
-
     fields = [
         ("Полное наименование", company_name),
         ("ИНН", data.get('inn', "Н/Д")),
@@ -287,12 +291,10 @@ def create_pro_pdf(data: dict, score: int, risks: list, warnings: list, color: c
         ("Дата регистрации", data.get('reg_date', "Н/Д")),
         ("Адрес", data.get('address', "Информация ограничена"))
     ]
-
     for label, value in fields:
         c.drawString(50, y, label + ":")
         y = draw_multiline(c, 210, y, value, font_size=10, max_width=340)
         y -= 8
-
     y -= 20
 
     # МАССОВОСТЬ
@@ -338,7 +340,7 @@ def create_pro_pdf(data: dict, score: int, risks: list, warnings: list, color: c
         y = draw_multiline(c, 60, y, f"• {risk}", max_width=480)
         y -= 4
 
-    # РЕКОМЕНДАЦИЯ (большой блок)
+    # РЕКОМЕНДАЦИЯ
     y -= 20
     c.setFont(FONT_NAME, 14)
     c.setFillColor(color)
@@ -354,13 +356,12 @@ def create_pro_pdf(data: dict, score: int, risks: list, warnings: list, color: c
     c.setFillColor(colors.grey)
     c.drawString(50, 40, f"OSINT PRO v2.4 • Источники: ЕГРЮЛ, Checko.ru • {datetime.now().strftime('%d.%m.%Y')}")
     c.drawString(400, 40, "Конфиденциально")
-
     c.showPage()
     c.save()
     buffer.seek(0)
     return buffer
 
-# ================= HANDLERS (обновлённые) =================
+# ================= HANDLERS =================
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
     await message.answer(
@@ -386,7 +387,6 @@ async def handle_search(message: Message):
     async with aiohttp.ClientSession() as session:
         egrul_task = session.get(f"https://egrul.org/short_data/?id={inn}")
         arb_task = get_arbitration_data(inn) if CHECKO_API_KEY else asyncio.sleep(0)
-
         egrul_resp = await egrul_task
         data = await egrul_resp.json(content_type=None) if egrul_resp.status == 200 else None
         arbitration_data = await arb_task if CHECKO_API_KEY else None
@@ -414,38 +414,65 @@ async def handle_search(message: Message):
         f"📌 **Рекомендация:** {recommendation}\n\n"
         f"Осталось бесплатных запросов сегодня: **{remaining}/3**\n\n"
     )
-
     if mass_flags:
         res += f"⚠️ **Массовость:** по {', '.join(mass_flags)}\n"
     if arbitration_data:
         arb_count = arbitration_data.get("total", 0) or len(arbitration_data.get("cases", []))
         if arb_count > 0:
             res += f"⚖️ **Арбитраж:** {arb_count} дел\n"
-
     res += "\n📄 **Полный профессиональный отчёт в PDF**"
 
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="📥 Скачать PDF", callback_data=f"pdf_{inn}")]])
-
     await wait.delete()
     await message.answer(res, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
 
 @dp.callback_query(F.data.startswith("pdf_"))
 async def send_pdf(call: CallbackQuery):
-    inn = call.data.split("_")[1]
+    inn = call.data.split("_", 1)[1]
     await call.answer("Генерирую подробный PDF-отчёт...")
 
-    async with aiohttp.ClientSession() as session:
-        async with session.get(f"https://egrul.org/short_data/?id={inn}") as resp:
-            data = await resp.json(content_type=None)
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(f"https://egrul.org/short_data/?id={inn}") as resp:
+                if resp.status != 200:
+                    raise ValueError(f"egrul.org вернул статус {resp.status}")
+                data = await resp.json(content_type=None)
 
-    arbitration_data = await get_arbitration_data(inn) if CHECKO_API_KEY else None
-    score, risks, warnings, color, _, arbitration_data, mass_flags = get_risk_assessment(data, arbitration_data)
-    pdf_buffer = create_pro_pdf(data, score, risks, warnings, color, arbitration_data, mass_flags)
+        if not isinstance(data, dict) or not data:
+            raise ValueError("Получены некорректные данные от egrul.org")
 
-    await call.message.answer_document(
-        BufferedInputFile(pdf_buffer.read(), filename=f"OSINT_PRO_{inn}.pdf"),
-        caption="✅ Подробный аналитический отчёт OSINT PRO v2.4"
-    )
+        arbitration_data = await get_arbitration_data(inn) if CHECKO_API_KEY else None
+
+        score, risks, warnings, color, _, arbitration_data, mass_flags = get_risk_assessment(
+            data, arbitration_data
+        )
+
+        pdf_buffer = create_pro_pdf(data, score, risks, warnings, color, arbitration_data, mass_flags)
+
+        await call.message.answer_document(
+            BufferedInputFile(pdf_buffer.read(), filename=f"OSINT_PRO_{inn}.pdf"),
+            caption="✅ Подробный аналитический отчёт OSINT PRO v2.4"
+        )
+
+    except Exception as e:
+        logger.error(f"PDF generation error for INN {inn} | User {call.from_user.id}", exc_info=True)
+        
+        await call.message.answer(
+            "❌ Не удалось сгенерировать PDF-отчёт.\n"
+            "Попробуйте позже или напишите администратору."
+        )
+        
+        if ADMIN_CHAT_ID:
+            try:
+                await bot.send_message(
+                    ADMIN_CHAT_ID,
+                    f"❌ Ошибка PDF!\n"
+                    f"ИНН: {inn}\n"
+                    f"Пользователь: {call.from_user.id} (@{call.from_user.username or '—'})\n"
+                    f"Ошибка: {type(e).__name__}: {e}"
+                )
+            except:
+                pass
 
 @dp.callback_query(F.data == "buy")
 async def buy_subscription(call: CallbackQuery):
@@ -480,12 +507,10 @@ async def main():
     app = web.Application()
     app.router.add_get("/", health_handler)
     app.router.add_post("/webhook", webhook_handler)
-
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, '0.0.0.0', int(os.environ.get("PORT", 10000)))
     await site.start()
-
     logger.info("🚀 OSINT PRO v2.4 запущен! (профессиональный PDF)")
     await asyncio.Event().wait()
 
