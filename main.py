@@ -8,7 +8,7 @@ from io import BytesIO
 import aiohttp
 import aiosqlite
 import gspread
-import pandas as pd   # для экспорта в Excel
+import pandas as pd
 from oauth2client.service_account import ServiceAccountCredentials
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, BufferedInputFile, Update
@@ -36,9 +36,9 @@ logger = logging.getLogger(__name__)
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 if CHECKO_API_KEY:
-    logger.info("✅ Checko API подключён — полный профиль + поиск по названию")
+    logger.info("✅ Checko API подключён — полный профиль + поиск + арбитраж")
 else:
-    logger.warning("⚠️ CHECKO_API_KEY не задан — поиск по названию недоступен")
+    logger.warning("⚠️ CHECKO_API_KEY не задан — используется только ЕГРЮЛ")
 # ================= FONT =================
 FONT_NAME = "DejaVuSans"
 FONT_PATH = "DejaVuSans.ttf"
@@ -234,7 +234,6 @@ async def get_arbitration_data(inn: str) -> dict | None:
         logger.error(f"Arbitration error: {e}")
         return None
 
-# === НОВОЕ: Поиск по названию компании ===
 async def search_by_name(query: str) -> list[dict] | None:
     if not CHECKO_API_KEY:
         return None
@@ -246,7 +245,6 @@ async def search_by_name(query: str) -> list[dict] | None:
                 if resp.status != 200:
                     return None
                 data = await resp.json()
-                # Возвращаем список результатов (Checko возвращает массив в "data")
                 return data.get("data", []) if isinstance(data.get("data"), list) else None
     except Exception as e:
         logger.error(f"Search by name error: {e}")
@@ -344,7 +342,32 @@ def safe_get_founders_count(data: dict) -> int:
     org = len(uch.get("РосОрг", [])) if isinstance(uch.get("РосОрг"), list) else 0
     return fl + org
 
-# ================= PDF v2.8 (ТАБЛИЦЫ + улучшения) =================
+def safe_get_okved(data: dict) -> str:
+    okved = data.get("ОКВЭД") or data.get("okved") or {}
+    if isinstance(okved, dict):
+        code = okved.get("Код") or okved.get("code") or "—"
+        name = okved.get("Наим") or okved.get("name") or ""
+        return f"{code} — {name}"
+    return str(okved) or "Н/Д"
+
+def get_arbitration_cases_table(arbitration_data: dict | None) -> list:
+    """Возвращает данные для таблицы арбитражных дел (максимум 6 записей)"""
+    if not arbitration_data or not isinstance(arbitration_data, dict):
+        return []
+    cases = arbitration_data.get("cases") or arbitration_data.get("data", {}).get("cases", [])
+    if not isinstance(cases, list):
+        return []
+    table = [["Дата", "Сумма", "Истец", "Ответчик", "Статус"]]
+    for case in cases[:6]:
+        date_str = case.get("Дата") or case.get("date") or "—"
+        amount = case.get("СуммаИск") or case.get("Сумма") or case.get("sum") or "—"
+        plaintiff = (case.get("Истец") or case.get("plaintiff") or "—")[:35]
+        defendant = (case.get("Ответчик") or case.get("defendant") or "—")[:35]
+        status = case.get("Статус") or case.get("status") or "—"
+        table.append([date_str, amount, plaintiff, defendant, status])
+    return table
+
+# ================= PDF v2.8 (ТАБЛИЦЫ + АРБИТРАЖ) =================
 def draw_multiline(c, x, y, text, font_size=10, max_width=480, line_height=14):
     if not text:
         return y
@@ -407,7 +430,7 @@ def create_pro_pdf(data: dict, score: int, risks: list, warnings: list, color: c
     c.drawString(220, y, f"{status_emoji} {status_text}")
     y -= 45
 
-    # КЛЮЧЕВЫЕ ФАКТЫ — ТАБЛИЦА
+    # КЛЮЧЕВЫЕ ФАКТЫ — ТАБЛИЦА (с ОКВЭД)
     c.setFont(FONT_NAME, 13)
     c.setFillColor(colors.black)
     c.drawString(50, y, "Ключевые факты")
@@ -416,6 +439,7 @@ def create_pro_pdf(data: dict, score: int, risks: list, warnings: list, color: c
     is_ip_flag = is_individual_entrepreneur(data)
     director = safe_get_director(data)
     branches = safe_get_branches(data)
+    okved = safe_get_okved(data)
 
     if is_ip_flag:
         table_data = [
@@ -425,6 +449,7 @@ def create_pro_pdf(data: dict, score: int, risks: list, warnings: list, color: c
             ["ФИО предпринимателя", director],
             ["Дата регистрации", calculate_age(data.get('ДатаРег', ''))],
             ["Адрес", get_formatted_address(data)],
+            ["Основной ОКВЭД", okved],
         ]
     else:
         table_data = [
@@ -437,6 +462,7 @@ def create_pro_pdf(data: dict, score: int, risks: list, warnings: list, color: c
             ["Адрес", get_formatted_address(data)],
             ["Уставный капитал", data.get('УставКапитал', '—')],
             ["Филиалы", f"{branches} шт." if branches else "—"],
+            ["Основной ОКВЭД", okved],
         ]
 
     table = Table(table_data, colWidths=[150, 320])
@@ -479,7 +505,7 @@ def create_pro_pdf(data: dict, score: int, risks: list, warnings: list, color: c
             y -= 5
         y -= 15
 
-    # УЧРЕДИТЕЛИ — теперь тоже в таблице
+    # УЧРЕДИТЕЛИ
     uchred = data.get("Учред", {})
     if uchred and uchred.get("ФЛ"):
         c.setFont(FONT_NAME, 13)
@@ -501,7 +527,7 @@ def create_pro_pdf(data: dict, score: int, risks: list, warnings: list, color: c
         ft.drawOn(c, 50, y - ft._height)
         y -= ft._height + 20
 
-    # РИСКИ — таблица
+    # РИСКИ
     if mass_flags or warnings or risks:
         c.setFont(FONT_NAME, 13)
         c.setFillColor(colors.orange)
@@ -522,14 +548,26 @@ def create_pro_pdf(data: dict, score: int, risks: list, warnings: list, color: c
         rt.drawOn(c, 50, y - rt._height)
         y -= rt._height + 20
 
-    # АРБИТРАЖ
-    if arbitration_data and isinstance(arbitration_data, dict):
-        arb_count = arbitration_data.get("total", 0) or len(arbitration_data.get("cases", []))
-        if arb_count > 0:
-            c.setFont(FONT_NAME, 13)
-            c.setFillColor(colors.red)
-            c.drawString(50, y, f"⚖️ Арбитражные дела — {arb_count} шт.")
-            y -= 30
+    # === НОВОЕ: ТАБЛИЦА АРБИТРАЖНЫХ ДЕЛ ===
+    arb_table_data = get_arbitration_cases_table(arbitration_data)
+    if len(arb_table_data) > 1:  # есть заголовок + хотя бы одна запись
+        c.setFont(FONT_NAME, 13)
+        c.setFillColor(colors.red)
+        c.drawString(50, y, "⚖️ Арбитражные дела (последние)")
+        y -= 28
+        arb_table = Table(arb_table_data, colWidths=[70, 80, 130, 130, 90])
+        arb_table.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor("#d32f2f")),
+            ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
+            ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+            ('GRID', (0, 0), (-1, -1), 1, colors.lightgrey),
+            ('FONTNAME', (0, 0), (-1, -1), FONT_NAME),
+            ('FONTSIZE', (0, 0), (-1, -1), 8),
+            ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+        ]))
+        arb_table.wrapOn(c, 50, y)
+        arb_table.drawOn(c, 50, y - arb_table._height)
+        y -= arb_table._height + 25
 
     # ЗАКЛЮЧЕНИЕ
     c.setFont(FONT_NAME, 14)
@@ -557,7 +595,7 @@ def create_pro_pdf(data: dict, score: int, risks: list, warnings: list, color: c
     buffer.seek(0)
     return buffer
 
-# ================= GOOGLE SHEETS =================
+# ================= GOOGLE SHEETS + EXCEL =================
 gc = None
 if GOOGLE_CREDENTIALS and SHEET_ID:
     try:
@@ -580,19 +618,14 @@ def log_to_sheet(user_id, inn, score: int):
     except Exception as e:
         logger.error(f"Sheet write error: {e}")
 
-# ================= NEW: EXPORT TO EXCEL =================
 async def export_stats_to_excel() -> BytesIO:
     async with aiosqlite.connect(DB_NAME) as db:
-        # usage_log
         async with db.execute("SELECT * FROM usage_log ORDER BY query_date DESC") as cur:
             usage_rows = await cur.fetchall()
         usage_df = pd.DataFrame(usage_rows, columns=["user_id", "query_date", "inn", "score"])
-        
-        # subscriptions
         async with db.execute("SELECT * FROM subscriptions") as cur:
             sub_rows = await cur.fetchall()
         sub_df = pd.DataFrame(sub_rows, columns=["user_id", "until_date"])
-    
     buffer = BytesIO()
     with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
         usage_df.to_excel(writer, sheet_name="Запросы", index=False)
@@ -604,7 +637,7 @@ async def export_stats_to_excel() -> BytesIO:
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
     is_admin = message.from_user.id == ADMIN_CHAT_ID
-    text = "🚀 **OSINT PRO v2.8**\n\nТеперь можно искать **по названию компании**!\n✅ Кэш • Таблицы в PDF • Экспорт статистики\n\nПришлите **ИНН / ОГРН** или **название компании**"
+    text = "🚀 **OSINT PRO v2.8**\n\nПоиск **по ИНН** и **по названию**!\n✅ Таблицы в PDF • Арбитражные дела • ОКВЭД\n\nПришлите ИНН / ОГРН или название компании"
     if is_admin:
         text += "\n\n👑 **Админ-панель:** /admin"
     await message.answer(text, parse_mode=ParseMode.MARKDOWN)
@@ -661,13 +694,11 @@ async def admin_revoke_start(call: CallbackQuery):
     await call.answer()
     await call.message.edit_text("🚫 Отправь мне сообщение в формате:\n/revoke <user_id>")
 
-# === Поиск по названию ===
 @dp.message(F.text & ~F.text.startswith("/"))
 async def handle_search(message: Message):
     text = message.text.strip()
     inn = "".join(re.findall(r'\d+', text))
 
-    # Если это ИНН/ОГРН — обычный поиск
     if len(inn) in (10, 12):
         can_use, remaining, is_premium = await check_limit(message.from_user.id)
         if not can_use:
@@ -714,14 +745,14 @@ async def handle_search(message: Message):
         await message.answer(res, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
         return
 
-    # === НОВОЕ: Поиск по названию ===
+    # Поиск по названию
     wait = await message.answer("🔎 Ищу компании по названию...")
     results = await search_by_name(text)
     if not results:
         return await wait.edit_text("❌ Компании с таким названием не найдены.\n\nПопробуйте уточнить название или введите ИНН.")
 
     kb = InlineKeyboardMarkup(inline_keyboard=[])
-    for item in results[:8]:  # максимум 8 результатов
+    for item in results[:8]:
         inn_found = item.get("ИНН") or item.get("inn")
         name = item.get("НаимСокр") or item.get("НаимПолн") or item.get("name") or "Без названия"
         if inn_found:
@@ -736,20 +767,16 @@ async def handle_search(message: Message):
 async def handle_select(call: CallbackQuery):
     inn = call.data.split("_", 1)[1]
     await call.answer("Открываю отчёт...")
-    # Просто переиспользуем логику PDF и данных
     try:
         data, arbitration_data, cache_time = await get_company_data(inn)
         if not data:
             return await call.message.answer("❌ Данные не найдены.")
-
         is_premium = await is_subscribed(call.from_user.id)
         score, risks, warnings, color, recommendation, arbitration_data, mass_flags = get_risk_assessment(data, arbitration_data)
-
         pdf_buffer = create_pro_pdf(
             data, score, risks, warnings, color, recommendation,
             arbitration_data, mass_flags, is_premium, cache_time
         )
-
         await call.message.answer_document(
             BufferedInputFile(pdf_buffer.read(), filename=f"OSINT_PRO_{inn}_v2.8.pdf"),
             caption="✅ Подробный профессиональный отчёт OSINT PRO v2.8"
@@ -758,7 +785,6 @@ async def handle_select(call: CallbackQuery):
         logger.error(f"Select error: {e}")
         await call.message.answer("❌ Ошибка открытия отчёта.")
 
-# Остальные обработчики (PDF, refresh, buy, history, admin-команды) остались без изменений
 @dp.callback_query(F.data.startswith("pdf_"))
 async def send_pdf(call: CallbackQuery):
     inn = call.data.split("_", 1)[1]
@@ -816,7 +842,6 @@ async def cmd_history(message: Message):
         logger.error(f"History error: {e}")
         await message.answer("❌ Не удалось загрузить историю.")
 
-# текстовые админ-команды (для совместимости)
 @dp.message(Command("grant"))
 async def cmd_grant(message: Message):
     if message.from_user.id != ADMIN_CHAT_ID: return await message.answer("⛔️ Доступ запрещён.")
@@ -866,7 +891,7 @@ async def main():
     await init_db()
     await bot.delete_webhook(drop_pending_updates=True)
     await bot.set_webhook(url=WEBHOOK_URL)
-    logger.info("🚀 OSINT PRO v2.8-fix запущен с поиском по названию + Excel-экспортом + таблицами в PDF!")
+    logger.info("🚀 OSINT PRO v2.8-fix запущен с таблицей арбитражных дел в PDF + ОКВЭД!")
     app = web.Application()
     app.router.add_get("/", health_handler)
     app.router.add_post("/webhook", webhook_handler)
