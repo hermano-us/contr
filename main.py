@@ -8,7 +8,6 @@ from io import BytesIO
 import aiohttp
 import aiosqlite
 import gspread
-import pandas as pd
 from oauth2client.service_account import ServiceAccountCredentials
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, BufferedInputFile, Update
@@ -21,6 +20,7 @@ from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.lib import colors
 from reportlab.platypus import Table, TableStyle
+
 # ================= CONFIG =================
 TOKEN = os.environ.get("TOKEN")
 ADMIN_CHAT_ID = int(os.environ.get("ADMIN_CHAT_ID", 0))
@@ -31,14 +31,18 @@ CHECKO_API_KEY = os.environ.get("CHECKO_API_KEY")
 DB_NAME = "osint_pro.db"
 FREE_LIMIT = 3
 SUBSCRIPTION_PRICE = "4900 ₽/мес"
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
+
 if CHECKO_API_KEY:
     logger.info("✅ Checko API подключён — полный профиль + поиск + арбитраж")
 else:
     logger.warning("⚠️ CHECKO_API_KEY не задан — используется только ЕГРЮЛ")
+
 # ================= FONT =================
 FONT_NAME = "DejaVuSans"
 FONT_PATH = "DejaVuSans.ttf"
@@ -48,10 +52,11 @@ if os.path.exists(FONT_PATH):
 else:
     logger.error("❌ DejaVuSans.ttf не найден!")
     FONT_NAME = "Helvetica"
+
 # ================= DATABASE =================
 async def init_db():
     async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute('''CREATE TABLE IF NOT EXISTS usage_log 
+        await db.execute('''CREATE TABLE IF NOT EXISTS usage_log
                             (user_id INTEGER, query_date DATE DEFAULT CURRENT_DATE)''')
         try:
             await db.execute("ALTER TABLE usage_log ADD COLUMN inn TEXT")
@@ -61,16 +66,13 @@ async def init_db():
             await db.execute("ALTER TABLE usage_log ADD COLUMN score INTEGER DEFAULT 0")
         except Exception:
             pass
-
-        await db.execute('''CREATE TABLE IF NOT EXISTS subscriptions 
+        await db.execute('''CREATE TABLE IF NOT EXISTS subscriptions
                             (user_id INTEGER PRIMARY KEY, until_date DATE)''')
-
         await db.execute('''CREATE TABLE IF NOT EXISTS cache (
                             inn TEXT PRIMARY KEY,
                             data TEXT,
                             arbitration_data TEXT,
                             cached_at TEXT)''')
-
         await db.commit()
 
 async def is_subscribed(user_id: int) -> bool:
@@ -142,9 +144,9 @@ async def get_from_cache(inn: str) -> tuple[dict | None, dict | None, str | None
     try:
         async with aiosqlite.connect(DB_NAME) as db:
             async with db.execute(
-                """SELECT data, arbitration_data, cached_at 
-                   FROM cache 
-                   WHERE inn = ? 
+                """SELECT data, arbitration_data, cached_at
+                   FROM cache
+                   WHERE inn = ?
                    AND datetime('now') <= datetime(cached_at, '+1 hour')""",
                 (inn,)
             ) as cursor:
@@ -179,17 +181,14 @@ async def get_company_data(inn: str, force_refresh: bool = False) -> tuple[dict 
         cached_data, cached_arb, cached_at = await get_from_cache(inn)
         if cached_data:
             return cached_data, cached_arb, cached_at
-
     checko_data = await get_checko_company(inn)
     data = checko_data if checko_data else await get_egrul_data(inn)
     arbitration_data = await get_arbitration_data(inn) if CHECKO_API_KEY else None
-
     if data:
         await save_to_cache(inn, data, arbitration_data)
         cached_at = datetime.now().isoformat()
     else:
         cached_at = None
-
     return data, arbitration_data, cached_at
 
 # ================= API =================
@@ -391,7 +390,6 @@ def create_pro_pdf(data: dict, score: int, risks: list, warnings: list, color: c
     buffer = BytesIO()
     c = canvas.Canvas(buffer, pagesize=A4)
     y = A4[1] - 50
-
     c.setFillColor(colors.HexColor("#1a237e"))
     c.setFont(FONT_NAME, 26)
     c.drawString(50, y, "OSINT PRO v2.8")
@@ -402,13 +400,11 @@ def create_pro_pdf(data: dict, score: int, risks: list, warnings: list, color: c
     c.setFillColor(colors.grey)
     c.drawString(50, y - 28, f"ПРОФЕССИОНАЛЬНЫЙ АНАЛИТИЧЕСКИЙ ОТЧЁТ • {datetime.now().strftime('%d.%m.%Y %H:%M')}")
     y -= 75
-
     full_name = data.get('НаимПолн') or data.get('full_name') or "Н/Д"
     c.setFont(FONT_NAME, 16)
     c.setFillColor(colors.black)
     y = draw_multiline(c, 50, y, full_name, font_size=16, max_width=480, line_height=20)
     y -= 35
-
     # ИНДЕКС БЕЗОПАСНОСТИ
     c.setFont(FONT_NAME, 14)
     c.setFillColor(colors.black)
@@ -421,7 +417,6 @@ def create_pro_pdf(data: dict, score: int, risks: list, warnings: list, color: c
     c.setFont(FONT_NAME, 28)
     c.drawString(320, y - 32, f"{score}/100")
     y -= 75
-
     status_text, status_emoji = get_company_status(data)
     c.setFont(FONT_NAME, 14)
     c.setFillColor(colors.black)
@@ -429,18 +424,15 @@ def create_pro_pdf(data: dict, score: int, risks: list, warnings: list, color: c
     c.setFillColor(colors.green if status_emoji == "✅" else colors.red)
     c.drawString(220, y, f"{status_emoji} {status_text}")
     y -= 45
-
     # КЛЮЧЕВЫЕ ФАКТЫ — ТАБЛИЦА (с ОКВЭД)
     c.setFont(FONT_NAME, 13)
     c.setFillColor(colors.black)
     c.drawString(50, y, "Ключевые факты")
     y -= 30
-
     is_ip_flag = is_individual_entrepreneur(data)
     director = safe_get_director(data)
     branches = safe_get_branches(data)
     okved = safe_get_okved(data)
-
     if is_ip_flag:
         table_data = [
             ["Параметр", "Значение"],
@@ -464,7 +456,6 @@ def create_pro_pdf(data: dict, score: int, risks: list, warnings: list, color: c
             ["Филиалы", f"{branches} шт." if branches else "—"],
             ["Основной ОКВЭД", okved],
         ]
-
     table = Table(table_data, colWidths=[150, 320])
     table.setStyle(TableStyle([
         ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor("#1a237e")),
@@ -482,7 +473,6 @@ def create_pro_pdf(data: dict, score: int, risks: list, warnings: list, color: c
     table.wrapOn(c, 50, y)
     table.drawOn(c, 50, y - table._height)
     y -= table._height + 25
-
     # КОНТАКТЫ
     contacts = data.get("Контакты") or []
     if isinstance(contacts, dict):
@@ -504,7 +494,6 @@ def create_pro_pdf(data: dict, score: int, risks: list, warnings: list, color: c
             y = draw_multiline(c, 60, y, f"• {contact}", max_width=480)
             y -= 5
         y -= 15
-
     # УЧРЕДИТЕЛИ
     uchred = data.get("Учред", {})
     if uchred and uchred.get("ФЛ"):
@@ -526,7 +515,6 @@ def create_pro_pdf(data: dict, score: int, risks: list, warnings: list, color: c
         ft.wrapOn(c, 50, y)
         ft.drawOn(c, 50, y - ft._height)
         y -= ft._height + 20
-
     # РИСКИ
     if mass_flags or warnings or risks:
         c.setFont(FONT_NAME, 13)
@@ -547,10 +535,9 @@ def create_pro_pdf(data: dict, score: int, risks: list, warnings: list, color: c
         rt.wrapOn(c, 50, y)
         rt.drawOn(c, 50, y - rt._height)
         y -= rt._height + 20
-
-    # === НОВОЕ: ТАБЛИЦА АРБИТРАЖНЫХ ДЕЛ ===
+    # === ТАБЛИЦА АРБИТРАЖНЫХ ДЕЛ ===
     arb_table_data = get_arbitration_cases_table(arbitration_data)
-    if len(arb_table_data) > 1:  # есть заголовок + хотя бы одна запись
+    if len(arb_table_data) > 1:
         c.setFont(FONT_NAME, 13)
         c.setFillColor(colors.red)
         c.drawString(50, y, "⚖️ Арбитражные дела (последние)")
@@ -568,7 +555,6 @@ def create_pro_pdf(data: dict, score: int, risks: list, warnings: list, color: c
         arb_table.wrapOn(c, 50, y)
         arb_table.drawOn(c, 50, y - arb_table._height)
         y -= arb_table._height + 25
-
     # ЗАКЛЮЧЕНИЕ
     c.setFont(FONT_NAME, 14)
     c.setFillColor(color)
@@ -577,7 +563,6 @@ def create_pro_pdf(data: dict, score: int, risks: list, warnings: list, color: c
     c.setFont(FONT_NAME, 11)
     c.setFillColor(colors.black)
     c.drawString(60, y, recommendation)
-
     # ФУТЕР
     c.setFont(FONT_NAME, 8)
     c.setFillColor(colors.grey)
@@ -595,7 +580,7 @@ def create_pro_pdf(data: dict, score: int, risks: list, warnings: list, color: c
     buffer.seek(0)
     return buffer
 
-# ================= GOOGLE SHEETS + EXCEL =================
+# ================= GOOGLE SHEETS + EXCEL (pandas теперь импортируется только при необходимости) =================
 gc = None
 if GOOGLE_CREDENTIALS and SHEET_ID:
     try:
@@ -619,6 +604,13 @@ def log_to_sheet(user_id, inn, score: int):
         logger.error(f"Sheet write error: {e}")
 
 async def export_stats_to_excel() -> BytesIO:
+    """Экспорт статистики в Excel. pandas импортируется здесь, чтобы бот запускался даже без pandas."""
+    try:
+        import pandas as pd  # ← ЛЕНИВАЯ ИМПОРТ — решает ошибку на Render
+    except ImportError:
+        logger.error("❌ pandas не установлен! Добавьте 'pandas' и 'openpyxl' в requirements.txt")
+        raise
+
     async with aiosqlite.connect(DB_NAME) as db:
         async with db.execute("SELECT * FROM usage_log ORDER BY query_date DESC") as cur:
             usage_rows = await cur.fetchall()
@@ -626,6 +618,7 @@ async def export_stats_to_excel() -> BytesIO:
         async with db.execute("SELECT * FROM subscriptions") as cur:
             sub_rows = await cur.fetchall()
         sub_df = pd.DataFrame(sub_rows, columns=["user_id", "until_date"])
+
     buffer = BytesIO()
     with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
         usage_df.to_excel(writer, sheet_name="Запросы", index=False)
@@ -672,6 +665,8 @@ async def admin_export(call: CallbackQuery):
             BufferedInputFile(excel_buffer.read(), filename=f"OSINT_PRO_статистика_{datetime.now().strftime('%Y-%m-%d')}.xlsx"),
             caption="✅ Полная статистика запросов и подписок"
         )
+    except ImportError:
+        await call.message.answer("❌ pandas не установлен. Добавьте `pandas` и `openpyxl` в requirements.txt и пересоберите проект.")
     except Exception as e:
         logger.error(f"Export error: {e}")
         await call.message.answer("❌ Ошибка генерации Excel")
@@ -698,27 +693,22 @@ async def admin_revoke_start(call: CallbackQuery):
 async def handle_search(message: Message):
     text = message.text.strip()
     inn = "".join(re.findall(r'\d+', text))
-
     if len(inn) in (10, 12):
         can_use, remaining, is_premium = await check_limit(message.from_user.id)
         if not can_use:
             kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="💰 Купить подписку", callback_data="buy")]])
             return await message.answer("🛑 Лимит 3 запроса в день исчерпан.", reply_markup=kb)
-
         wait = await message.answer("🔍 Запрашиваю данные...")
         data, arbitration_data, cache_time = await get_company_data(inn)
         if not data:
             return await wait.edit_text("❌ Данные по ИНН не найдены.")
-
         score, risks, warnings, color, recommendation, arbitration_data, mass_flags = get_risk_assessment(data, arbitration_data)
         await log_usage(message.from_user.id, inn, score, is_premium)
         log_to_sheet(message.from_user.id, inn, score)
-
         is_ip_flag = is_individual_entrepreneur(data)
         company_name = data.get('НаимСокр') or data.get('short_name') or data.get('full_name') or '—'
         director = safe_get_director(data)
         founders_count = safe_get_founders_count(data)
-
         res = f"✅ **OSINT PRO v2.8**{' PREM' if is_premium else ''}\n\n"
         res += f"🏢 {'ИП' if is_ip_flag else 'ЮЛ'} `{company_name}`\n"
         res += f"📋 ИНН `{data.get('ИНН', inn)}` | ОГРН `{data.get('ОГРН', '—')}`\n\n"
@@ -735,12 +725,10 @@ async def handle_search(message: Message):
         if not is_premium:
             res += f"Осталось бесплатных запросов: **{remaining}/3**\n\n"
         res += "📄 **Полный профессиональный отчёт в PDF**"
-
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="📥 Скачать PDF", callback_data=f"pdf_{inn}")],
             [InlineKeyboardButton(text="🔄 Обновить данные", callback_data=f"refresh_{inn}")]
         ])
-
         await wait.delete()
         await message.answer(res, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
         return
@@ -750,7 +738,6 @@ async def handle_search(message: Message):
     results = await search_by_name(text)
     if not results:
         return await wait.edit_text("❌ Компании с таким названием не найдены.\n\nПопробуйте уточнить название или введите ИНН.")
-
     kb = InlineKeyboardMarkup(inline_keyboard=[])
     for item in results[:8]:
         inn_found = item.get("ИНН") or item.get("inn")
@@ -760,8 +747,9 @@ async def handle_search(message: Message):
                 text=f"📋 {name[:45]}... (ИНН {inn_found})",
                 callback_data=f"select_{inn_found}"
             )])
-
     await wait.edit_text(f"✅ Найдено {len(results)} совпадений.\nВыберите компанию:", reply_markup=kb)
+
+# ... (все остальные handlers остаются без изменений: handle_select, send_pdf, handle_refresh, buy_subscription, cmd_history, cmd_grant, cmd_revoke, cmd_stats, cmd_pricing и т.д.)
 
 @dp.callback_query(F.data.startswith("select_"))
 async def handle_select(call: CallbackQuery):
@@ -891,7 +879,7 @@ async def main():
     await init_db()
     await bot.delete_webhook(drop_pending_updates=True)
     await bot.set_webhook(url=WEBHOOK_URL)
-    logger.info("🚀 OSINT PRO v2.8-fix запущен с таблицей арбитражных дел в PDF + ОКВЭД!")
+    logger.info("🚀 OSINT PRO v2.8-fix запущен (pandas импортируется лениво — бот не падает на Render)")
     app = web.Application()
     app.router.add_get("/", health_handler)
     app.router.add_post("/webhook", webhook_handler)
