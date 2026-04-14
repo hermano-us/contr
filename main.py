@@ -5,7 +5,6 @@ import re
 import json
 from datetime import datetime, date
 from io import BytesIO
-
 import aiohttp
 import aiosqlite
 import gspread
@@ -48,7 +47,7 @@ except Exception:
 # ================= DATABASE =================
 async def init_db():
     async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute('''CREATE TABLE IF NOT EXISTS usage_log 
+        await db.execute('''CREATE TABLE IF NOT EXISTS usage_log
                            (user_id INTEGER, query_date DATE DEFAULT CURRENT_DATE)''')
         await db.commit()
 
@@ -103,7 +102,6 @@ def log_to_sheet(user_id, inn, status):
 def get_risk_assessment(data: dict):
     score = 100
     risk_factors = []
-
     reg_date_str = data.get('reg_date', '')
     if reg_date_str:
         try:
@@ -117,15 +115,12 @@ def get_risk_assessment(data: dict):
                 risk_factors.append("🟡 Молодая компания (менее 3 лет)")
         except:
             pass
-
     status = str(data.get('status') or data.get('status_text') or "").lower()
     if any(x in status for x in ["ликвидац", "банкрот", "прекращ"]):
         score -= 80
         risk_factors.append("🚨 ОПАСНО: в процессе ликвидации / банкротства")
-
     if score > 60:
         risk_factors.append("✅ Критических арбитражных дел не обнаружено")
-
     color = colors.green if score > 70 else colors.orange if score > 40 else colors.red
     return score, risk_factors, color
 
@@ -133,17 +128,14 @@ def create_pro_pdf(data: dict, score: int, risks: list, color: colors):
     buffer = BytesIO()
     c = canvas.Canvas(buffer, pagesize=A4)
     w, h = A4
-
     c.setFillColor(colors.HexColor("#f4f4f4"))
     c.rect(0, h - 100, w, 100, fill=1, stroke=0)
     c.setFillColor(colors.HexColor("#1a237e"))
     c.setFont(FONT_NAME, 24)
     c.drawString(50, h - 60, "АНАЛИТИЧЕСКИЙ ОТЧЁТ OSINT PRO")
-
     c.setFont(FONT_NAME, 10)
     c.setFillColor(colors.grey)
     c.drawString(50, h - 80, f"Сформировано: {datetime.now().strftime('%d.%m.%Y %H:%M')}")
-
     c.setFont(FONT_NAME, 14)
     c.setFillColor(colors.black)
     c.drawString(50, h - 140, "ИНДЕКС БЕЗОПАСНОСТИ:")
@@ -154,7 +146,6 @@ def create_pro_pdf(data: dict, score: int, risks: list, color: colors):
     c.setFillColor(colors.black)
     c.setFont(FONT_NAME, 16)
     c.drawString(270, h - 165, f"{score} / 100")
-
     y = h - 220
     info = [
         ("Организация:", data.get('name') or data.get('short_name') or "Н/Д"),
@@ -170,7 +161,6 @@ def create_pro_pdf(data: dict, score: int, risks: list, color: colors):
         c.setFillColor(colors.black)
         c.drawString(180, y, str(val))
         y -= 28
-
     y -= 20
     c.setStrokeColor(colors.lightgrey)
     c.line(50, y, 550, y)
@@ -182,7 +172,6 @@ def create_pro_pdf(data: dict, score: int, risks: list, color: colors):
     for risk in risks:
         c.drawString(60, y, risk)
         y -= 22
-
     c.showPage()
     c.save()
     buffer.seek(0)
@@ -203,37 +192,29 @@ async def handle_search(message: Message):
     inn = "".join(re.findall(r'\d+', message.text))
     if len(inn) not in (10, 12):
         return
-
     if not await check_limit(message.from_user.id):
         kb = InlineKeyboardMarkup(inline_keyboard=[[
             InlineKeyboardButton(text="💰 Купить подписку", callback_data="buy")
         ]])
         return await message.answer("🛑 Лимит 3 запроса в день исчерпан.", reply_markup=kb)
-
     wait = await message.answer("🔍 Идёт анализ по реестрам ФНС...")
-
     async with aiohttp.ClientSession() as session:
         async with session.get(f"https://egrul.org/short_data/?id={inn}") as resp:
             data = await resp.json(content_type=None) if resp.status == 200 else None
-
     if not data:
         return await wait.edit_text("❌ Данные по ИНН не найдены.")
-
     await log_usage(message.from_user.id)
     score, risks, color = get_risk_assessment(data)
     log_to_sheet(message.from_user.id, inn, f"score:{score}")
-
     res = (
         f"✅ **ОТЧЁТ OSINT PRO**\n\n"
         f"🏢 `{data.get('name') or '—'}`\n"
         f"🛡️ Индекс безопасности: `{score}/100`\n"
         f"📄 Полный аудит в PDF ниже."
     )
-
     kb = InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="📥 Скачать PDF", callback_data=f"pdf_{inn}")
     ]])
-
     await wait.delete()
     await message.answer(res, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
 
@@ -241,14 +222,11 @@ async def handle_search(message: Message):
 async def send_pdf(call: CallbackQuery):
     inn = call.data.split("_")[1]
     await call.answer("Генерирую PDF...")
-
     async with aiohttp.ClientSession() as session:
         async with session.get(f"https://egrul.org/short_data/?id={inn}") as resp:
             data = await resp.json(content_type=None)
-
     score, risks, color = get_risk_assessment(data)
     pdf_buffer = create_pro_pdf(data, score, risks, color)
-
     await call.message.answer_document(
         BufferedInputFile(pdf_buffer.read(), filename=f"OSINT_PRO_{inn}.pdf"),
         caption="✅ Аналитический отчёт готов"
@@ -271,21 +249,25 @@ async def webhook_handler(request):
     try:
         data = await request.json()
         update = Update.model_validate(data)
-        
-        # ← Вот эта строка была главной ошибкой
+
+        # ← ИСПРАВЛЕНИЕ: aiogram 3.x использует dp.feed_update
         await dp.feed_update(bot=bot, update=update)
-        logger.info(f"Получен update от пользователя {update.message.from_user.id if update.message else '—'}")
-        
+
+        # Для отладки (можно потом удалить)
+        logger.info(f"✅ Update обработан (update_id={update.update_id})")
+
         return web.Response(text="OK", status=200)
-    
+
     except Exception as e:
         logger.error(f"Webhook error: {e}")
-        # Важно: Telegramу всегда возвращаем 200, иначе он будет спамить ретраями
+        # Telegram ОБЯЗАТЕЛЬНО должен получать 200
         return web.Response(text="OK", status=200)
 
+# ================= MAIN =================
 async def main():
     await init_db()
-
+    
+    # Удаляем старый вебхук и ставим новый
     await bot.delete_webhook(drop_pending_updates=True)
     await bot.set_webhook(url=WEBHOOK_URL)
     logger.info(f"✅ Webhook установлен: {WEBHOOK_URL}")
@@ -296,9 +278,12 @@ async def main():
 
     runner = web.AppRunner(app)
     await runner.setup()
-    await web.TCPSite(runner, '0.0.0.0', int(os.environ.get("PORT", 10000))).start()
+    site = web.TCPSite(runner, '0.0.0.0', int(os.environ.get("PORT", 10000)))
+    await site.start()
 
     logger.info("🚀 OSINT PRO v2.0 запущен успешно!")
+    
+    # Держим сервис живым
     await asyncio.Event().wait()
 
 if __name__ == "__main__":
