@@ -28,6 +28,12 @@ WEBHOOK_URL = os.environ.get("WEBHOOK_URL")
 GOOGLE_CREDENTIALS = os.environ.get("GOOGLE_CREDENTIALS")
 SHEET_ID = os.environ.get("SHEET_ID")
 CHECKO_API_KEY = os.environ.get("CHECKO_API_KEY")
+
+# ================= НОВОЕ: AI-анализ (ТОП-2) =================
+AI_PROVIDER = os.environ.get("AI_PROVIDER", "openai").lower()  # openai | grok
+AI_API_KEY = os.environ.get("AI_API_KEY")
+AI_MODEL = os.environ.get("AI_MODEL", "gpt-4o-mini" if AI_PROVIDER == "openai" else "grok-beta")
+
 DB_NAME = "osint_pro.db"
 FREE_LIMIT = 3
 SUBSCRIPTION_PRICE = "4900 ₽/мес"
@@ -35,10 +41,16 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
+
 if CHECKO_API_KEY:
-    logger.info("✅ Checko API подключён — полный профиль + поиск + арбитраж")
+    logger.info("✅ Checko API подключён")
 else:
-    logger.warning("⚠️ CHECKO_API_KEY не задан — используется только ЕГРЮЛ")
+    logger.warning("⚠️ CHECKO_API_KEY не задан")
+
+if AI_API_KEY:
+    logger.info(f"✅ AI-анализ подключён ({AI_PROVIDER.upper()} / {AI_MODEL})")
+else:
+    logger.warning("⚠️ AI_API_KEY не задан — AI-резюме будет отключено")
 # ================= FONT =================
 FONT_NAME = "DejaVuSans"
 FONT_PATH = "DejaVuSans.ttf"
@@ -63,7 +75,6 @@ async def init_db():
             pass
         await db.execute('''CREATE TABLE IF NOT EXISTS subscriptions
                             (user_id INTEGER PRIMARY KEY, until_date DATE)''')
-        # ================= НОВАЯ ТАБЛИЦА ДЛЯ МОНИТОРИНГА (ЭТАП 2) =================
         await db.execute('''CREATE TABLE IF NOT EXISTS monitored (
                             user_id INTEGER,
                             inn TEXT,
@@ -182,7 +193,7 @@ async def get_company_data(inn: str, force_refresh: bool = False) -> tuple[dict 
     else:
         cached_at = None
     return data, arbitration_data, cached_at
-# ================= MONITORING SYSTEM (ЭТАП 2) =================
+# ================= MONITORING SYSTEM =================
 async def is_monitored(user_id: int, inn: str) -> bool:
     try:
         async with aiosqlite.connect(DB_NAME) as db:
@@ -224,7 +235,6 @@ async def add_to_monitoring(user_id: int, inn: str) -> bool:
                 (user_id, inn, datetime.now().isoformat(), full_name, status_text, score, arb_count, director)
             )
             await db.commit()
-        logger.info(f"✅ Компания {inn} добавлена в мониторинг для пользователя {user_id}")
         return True
     except Exception as e:
         logger.error(f"Add to monitoring error: {e}")
@@ -235,12 +245,10 @@ async def remove_from_monitoring(user_id: int, inn: str):
         async with aiosqlite.connect(DB_NAME) as db:
             await db.execute("DELETE FROM monitored WHERE user_id = ? AND inn = ?", (user_id, inn))
             await db.commit()
-        logger.info(f"✅ Компания {inn} удалена из мониторинга для пользователя {user_id}")
     except Exception as e:
         logger.error(f"Remove from monitoring error: {e}")
 
 async def check_monitored_companies():
-    """Фоновая проверка всех компаний в мониторинге (каждые 4 часа)"""
     try:
         async with aiosqlite.connect(DB_NAME) as db:
             async with db.execute("SELECT user_id, inn FROM monitored") as cursor:
@@ -265,7 +273,6 @@ async def check_monitored_companies():
             director = safe_get_director(data)
             full_name = data.get('НаимПолн') or data.get('full_name') or "Н/Д"
 
-            # Получаем предыдущее состояние
             async with aiosqlite.connect(DB_NAME) as db:
                 async with db.execute(
                     """SELECT last_status, last_arb_count, last_director 
@@ -284,7 +291,6 @@ async def check_monitored_companies():
                 if director != last_dir and director != "Н/Д":
                     changes.append(f"👤 Сменился руководитель → {director}")
 
-            # Обновляем состояние в БД
             async with aiosqlite.connect(DB_NAME) as db:
                 await db.execute(
                     """INSERT OR REPLACE INTO monitored 
@@ -308,16 +314,69 @@ async def check_monitored_companies():
                     parse_mode=ParseMode.MARKDOWN,
                     reply_markup=kb
                 )
-                logger.info(f"📨 Уведомление отправлено пользователю {user_id} по {inn}")
         except Exception as e:
             logger.error(f"Monitoring check error for {inn} (user {user_id}): {e}")
             continue
 
 async def monitoring_scheduler():
-    """Фоновая задача — проверка мониторинга каждые 4 часа"""
     while True:
         await check_monitored_companies()
-        await asyncio.sleep(14400)  # 4 часа
+        await asyncio.sleep(14400)
+# ================= AI ANALYSIS (ТОП-2) =================
+async def get_ai_summary(data: dict, score: int, risks: list, recommendation: str, arbitration_data: dict | None = None) -> str:
+    """Генерирует короткое профессиональное резюме на русском с помощью Grok / OpenAI"""
+    if not AI_API_KEY:
+        return "🔹 AI-анализ временно недоступен (администратор ещё не подключил ключ)"
+
+    company_name = data.get('НаимПолн') or data.get('full_name') or data.get('НаимСокр') or "Компания"
+    inn = data.get('ИНН', '—')
+    arb_count = 0
+    if arbitration_data and isinstance(arbitration_data, dict):
+        arb_count = arbitration_data.get("total", 0) or len(arbitration_data.get("cases", []))
+
+    prompt = f"""Ты — строгий эксперт по проверке контрагентов в России (OSINT PRO).
+Проанализируй данные компании и дай **короткое (максимум 3–4 предложения), честное и полезное резюме** на русском языке.
+
+Название: {company_name}
+ИНН: {inn}
+Индекс безопасности: {score}/100
+Рекомендация системы: {recommendation}
+Риски: {', '.join(risks) if risks else 'критических рисков нет'}
+Арбитражных дел: {arb_count}
+
+Стиль: профессиональный, лаконичный, с эмодзи. Начинай строго с фразы:
+✅ Вывод OSINT PRO AI:"""
+
+    try:
+        if AI_PROVIDER == "openai":
+            url = "https://api.openai.com/v1/chat/completions"
+        else:  # grok
+            url = "https://api.x.ai/v1/chat/completions"
+
+        headers = {
+            "Authorization": f"Bearer {AI_API_KEY}",
+            "Content-Type": "application/json"
+        }
+        payload = {
+            "model": AI_MODEL,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.65,
+            "max_tokens": 280
+        }
+
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, json=payload, headers=headers, timeout=12) as resp:
+                if resp.status != 200:
+                    error_text = await resp.text()
+                    logger.error(f"AI API error {resp.status}: {error_text}")
+                    return "🔹 AI-анализ временно недоступен (ошибка API)"
+                
+                result = await resp.json()
+                summary = result["choices"][0]["message"]["content"].strip()
+                return summary
+    except Exception as e:
+        logger.error(f"AI summary error: {e}")
+        return "🔹 AI-анализ временно недоступен (техническая ошибка)"
 # ================= API =================
 async def get_checko_company(inn: str) -> dict | None:
     if not CHECKO_API_KEY:
@@ -421,7 +480,7 @@ def get_risk_assessment(data: dict, arbitration_data: dict | None = None):
     if data.get("ЮрАдрес", {}).get("МассАдрес"):
         score -= 30
         risk_factors.append("🚨 Массовый юридический адрес")
-        mass_flags.append("Адрес")
+        mass_flags.append("Массовый адрес")
     arb_count = 0
     if arbitration_data and isinstance(arbitration_data, dict):
         arb_count = arbitration_data.get("total", 0) or len(arbitration_data.get("cases", []))
@@ -464,7 +523,6 @@ def safe_get_okved(data: dict) -> str:
         return f"{code} — {name}"
     return str(okved) or "Н/Д"
 def get_arbitration_cases_table(arbitration_data: dict | None) -> list:
-    """Возвращает данные для таблицы арбитражных дел (максимум 6 записей)"""
     if not arbitration_data or not isinstance(arbitration_data, dict):
         return []
     cases = arbitration_data.get("cases") or arbitration_data.get("data", {}).get("cases", [])
@@ -479,7 +537,7 @@ def get_arbitration_cases_table(arbitration_data: dict | None) -> list:
         status = case.get("Статус") or case.get("status") or "—"
         table.append([date_str, amount, plaintiff, defendant, status])
     return table
-# ================= PDF v2.8 (ТАБЛИЦЫ + АРБИТРАЖ) =================
+# ================= PREMIUM PDF (без изменений) =================
 def draw_multiline(c, x, y, text, font_size=10, max_width=480, line_height=14):
     if not text:
         return y
@@ -496,64 +554,90 @@ def draw_multiline(c, x, y, text, font_size=10, max_width=480, line_height=14):
         c.drawString(x, y, line)
         y -= line_height
     return y
+
 def create_pro_pdf(data: dict, score: int, risks: list, warnings: list, color: colors,
                    recommendation: str, arbitration_data: dict | None, mass_flags: list,
                    is_premium: bool, cache_time: str | None = None):
     buffer = BytesIO()
     c = canvas.Canvas(buffer, pagesize=A4)
-    y = A4[1] - 50
-    c.setFillColor(colors.HexColor("#1a237e"))
-    c.setFont(FONT_NAME, 26)
-    c.drawString(50, y, "OSINT PRO v2.8")
-    if is_premium:
-        c.setFillColor(colors.HexColor("#00b300"))
-        c.drawString(380, y - 5, "PREMIUM")
-    c.setFont(FONT_NAME, 11)
-    c.setFillColor(colors.grey)
-    c.drawString(50, y - 28, f"ПРОФЕССИОНАЛЬНЫЙ АНАЛИТИЧЕСКИЙ ОТЧЁТ • {datetime.now().strftime('%d.%m.%Y %H:%M')}")
-    y -= 75
-    full_name = data.get('НаимПолн') or data.get('full_name') or "Н/Д"
-    c.setFont(FONT_NAME, 16)
-    c.setFillColor(colors.black)
-    y = draw_multiline(c, 50, y, full_name, font_size=16, max_width=480, line_height=20)
-    y -= 35
-    # ИНДЕКС БЕЗОПАСНОСТИ
-    c.setFont(FONT_NAME, 14)
-    c.setFillColor(colors.black)
-    c.drawString(50, y, "ИНДЕКС БЕЗОПАСНОСТИ")
-    c.setStrokeColor(colors.lightgrey)
-    c.roundRect(50, y - 38, 250, 38, 8, stroke=1, fill=0)
-    c.setFillColor(color)
-    c.roundRect(50, y - 38, 2.4 * score, 38, 8, stroke=0, fill=1)
-    c.setFillColor(colors.black)
+    y = 800
+
+    c.setFillColor(colors.HexColor("#0a1f44"))
+    c.rect(0, y + 10, 595, 70, fill=1, stroke=0)
+    
+    c.setFillColor(colors.white)
     c.setFont(FONT_NAME, 28)
-    c.drawString(320, y - 32, f"{score}/100")
-    y -= 75
+    c.drawString(45, y + 45, "OSINT PRO")
+    
+    c.setFont(FONT_NAME, 11)
+    c.drawString(45, y + 28, "ПРОФЕССИОНАЛЬНЫЙ АНАЛИТИЧЕСКИЙ ОТЧЁТ")
+    
+    if is_premium:
+        c.setFillColor(colors.HexColor("#00c853"))
+        c.setFont(FONT_NAME, 13)
+        c.drawString(420, y + 48, "PREMIUM")
+    
+    c.setFillColor(colors.white)
+    c.setFont(FONT_NAME, 10)
+    c.drawString(45, y + 12, f"{datetime.now().strftime('%d.%m.%Y %H:%M')} • Checko.ru + ЕГРЮЛ")
+
+    y -= 85
+
+    full_name = data.get('НаимПолн') or data.get('full_name') or "Н/Д"
     status_text, status_emoji = get_company_status(data)
+    
+    c.setFont(FONT_NAME, 18)
+    c.setFillColor(colors.black)
+    y = draw_multiline(c, 45, y, f"{status_emoji} {full_name}", font_size=18, max_width=500, line_height=22)
+    y -= 12
+
     c.setFont(FONT_NAME, 14)
+    c.setFillColor(colors.HexColor("#0a1f44"))
+    c.drawString(45, y, "ИНДЕКС БЕЗОПАСНОСТИ")
+    
+    bar_width = 280
+    bar_height = 28
+    c.setStrokeColor(colors.lightgrey)
+    c.setLineWidth(2)
+    c.roundRect(45, y - 38, bar_width, bar_height, 6, stroke=1, fill=0)
+    
+    fill_width = (score / 100) * bar_width
+    c.setFillColor(color)
+    c.roundRect(45, y - 38, fill_width, bar_height, 6, stroke=0, fill=1)
+    
+    c.setFont(FONT_NAME, 32)
     c.setFillColor(colors.black)
-    c.drawString(50, y, "Статус компании")
-    c.setFillColor(colors.green if status_emoji == "✅" else colors.red)
-    c.drawString(220, y, f"{status_emoji} {status_text}")
-    y -= 45
-    # КЛЮЧЕВЫЕ ФАКТЫ — ТАБЛИЦА (с ОКВЭД)
+    c.drawString(360, y - 33, f"{score}")
+    c.setFont(FONT_NAME, 14)
+    c.drawString(415, y - 33, "/100")
+    
+    risk_label = "НИЗКИЙ РИСК" if score > 75 else "СРЕДНИЙ РИСК" if score > 45 else "ВЫСОКИЙ РИСК"
+    risk_color = colors.green if score > 75 else colors.orange if score > 45 else colors.red
+    c.setFillColor(risk_color)
+    c.setFont(FONT_NAME, 11)
+    c.drawString(360, y - 55, risk_label)
+    
+    y -= 85
+
     c.setFont(FONT_NAME, 13)
-    c.setFillColor(colors.black)
-    c.drawString(50, y, "Ключевые факты")
-    y -= 30
+    c.setFillColor(colors.HexColor("#0a1f44"))
+    c.drawString(45, y, "КЛЮЧЕВЫЕ ФАКТЫ")
+    y -= 28
+
     is_ip_flag = is_individual_entrepreneur(data)
     director = safe_get_director(data)
     branches = safe_get_branches(data)
     okved = safe_get_okved(data)
+
     if is_ip_flag:
         table_data = [
             ["Параметр", "Значение"],
             ["ИНН", data.get('ИНН', '—')],
             ["ОГРНИП", data.get('ОГРНИП', data.get('ОГРН', '—'))],
-            ["ФИО предпринимателя", director],
-            ["Дата регистрации", calculate_age(data.get('ДатаРег', ''))],
+            ["Предприниматель", director],
+            ["Регистрация", calculate_age(data.get('ДатаРег', ''))],
             ["Адрес", get_formatted_address(data)],
-            ["Основной ОКВЭД", okved],
+            ["ОКВЭД", okved],
         ]
     else:
         table_data = [
@@ -562,30 +646,32 @@ def create_pro_pdf(data: dict, score: int, risks: list, warnings: list, color: c
             ["ОГРН", data.get('ОГРН', '—')],
             ["КПП", data.get('КПП', '—')],
             ["Руководитель", director],
-            ["Дата регистрации", calculate_age(data.get('ДатаРег', ''))],
+            ["Регистрация", calculate_age(data.get('ДатаРег', ''))],
             ["Адрес", get_formatted_address(data)],
             ["Уставный капитал", data.get('УставКапитал', '—')],
             ["Филиалы", f"{branches} шт." if branches else "—"],
-            ["Основной ОКВЭД", okved],
+            ["ОКВЭД", okved],
         ]
-    table = Table(table_data, colWidths=[150, 320])
+
+    table = Table(table_data, colWidths=[170, 300])
     table.setStyle(TableStyle([
-        ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor("#1a237e")),
+        ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor("#0a1f44")),
         ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
         ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
         ('FONTNAME', (0, 0), (-1, 0), FONT_NAME),
         ('FONTSIZE', (0, 0), (-1, 0), 11),
-        ('BOTTOMPADDING', (0, 0), (-1, 0), 8),
+        ('BOTTOMPADDING', (0, 0), (-1, 0), 10),
         ('BACKGROUND', (0, 1), (-1, -1), colors.white),
-        ('GRID', (0, 0), (-1, -1), 1, colors.lightgrey),
+        ('GRID', (0, 0), (-1, -1), 1, colors.HexColor("#e0e0e0")),
         ('FONTNAME', (0, 1), (-1, -1), FONT_NAME),
         ('FONTSIZE', (0, 1), (-1, -1), 10),
         ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+        ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor("#f8f9fa")]),
     ]))
-    table.wrapOn(c, 50, y)
-    table.drawOn(c, 50, y - table._height)
-    y -= table._height + 25
-    # КОНТАКТЫ
+    table.wrapOn(c, 45, y)
+    table.drawOn(c, 45, y - table._height)
+    y -= table._height + 35
+
     contacts = data.get("Контакты") or []
     if isinstance(contacts, dict):
         flat = []
@@ -595,98 +681,121 @@ def create_pro_pdf(data: dict, score: int, risks: list, warnings: list, color: c
             elif v:
                 flat.append(f"{k}: {v}")
         contacts = flat
+
     if contacts:
         c.setFont(FONT_NAME, 13)
-        c.setFillColor(colors.blue)
-        c.drawString(50, y, "📞 Контакты")
-        y -= 22
-        c.setFont(FONT_NAME, 10)
-        c.setFillColor(colors.black)
-        for contact in contacts[:8]:
-            y = draw_multiline(c, 60, y, f"• {contact}", max_width=480)
-            y -= 5
-        y -= 15
-    # УЧРЕДИТЕЛИ
+        c.setFillColor(colors.HexColor("#0a1f44"))
+        c.drawString(45, y, "📞 КОНТАКТЫ")
+        y -= 25
+
+        contact_table_data = [["Тип", "Значение"]]
+        for contact in contacts[:10]:
+            if ":" in contact:
+                typ, val = contact.split(":", 1)
+                contact_table_data.append([typ.strip(), val.strip()])
+            else:
+                contact_table_data.append(["Контакт", contact])
+
+        ct = Table(contact_table_data, colWidths=[120, 350])
+        ct.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor("#1565c0")),
+            ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
+            ('GRID', (0, 0), (-1, -1), 1, colors.lightgrey),
+            ('FONTNAME', (0, 0), (-1, -1), FONT_NAME),
+            ('FONTSIZE', (0, 0), (-1, -1), 9.5),
+            ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor("#f0f7ff")]),
+        ]))
+        ct.wrapOn(c, 45, y)
+        ct.drawOn(c, 45, y - ct._height)
+        y -= ct._height + 30
+
     uchred = data.get("Учред", {})
     if uchred and uchred.get("ФЛ"):
         c.setFont(FONT_NAME, 13)
-        c.setFillColor(colors.black)
-        c.drawString(50, y, "👥 Учредители")
+        c.setFillColor(colors.HexColor("#0a1f44"))
+        c.drawString(45, y, "👥 УЧРЕДИТЕЛИ")
         y -= 25
         founders_table = [["ФИО", "Доля %"]]
-        for fl in uchred.get("ФЛ", [])[:6]:
+        for fl in uchred.get("ФЛ", [])[:8]:
             founders_table.append([fl.get('ФИО', '—'), f"{fl.get('Доля', '—')}%"])
-        ft = Table(founders_table, colWidths=[280, 140])
+        ft = Table(founders_table, colWidths=[300, 170])
         ft.setStyle(TableStyle([
-            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor("#1a237e")),
+            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor("#0a1f44")),
             ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
             ('GRID', (0, 0), (-1, -1), 1, colors.lightgrey),
             ('FONTNAME', (0, 0), (-1, -1), FONT_NAME),
-            ('FONTSIZE', (0, 0), (-1, -1), 9),
+            ('FONTSIZE', (0, 0), (-1, -1), 9.5),
         ]))
-        ft.wrapOn(c, 50, y)
-        ft.drawOn(c, 50, y - ft._height)
-        y -= ft._height + 20
-    # РИСКИ
-    if mass_flags or warnings or risks:
+        ft.wrapOn(c, 45, y)
+        ft.drawOn(c, 45, y - ft._height)
+        y -= ft._height + 30
+
+    all_risks = warnings + mass_flags + risks
+    if all_risks:
         c.setFont(FONT_NAME, 13)
         c.setFillColor(colors.orange)
-        c.drawString(50, y, "⚠️ Риски и предупреждения")
+        c.drawString(45, y, "⚠️ РИСКИ И ПРЕДУПРЕЖДЕНИЯ")
         y -= 25
-        risk_table = [["Тип", "Описание"]]
-        for item in warnings + mass_flags + risks:
+        risk_table = [["", "Описание"]]
+        for item in all_risks:
             risk_table.append(["⚠️", item])
-        rt = Table(risk_table, colWidths=[60, 400])
+        rt = Table(risk_table, colWidths=[35, 430])
         rt.setStyle(TableStyle([
-            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor("#ff9800")),
+            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor("#f57c00")),
             ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
             ('GRID', (0, 0), (-1, -1), 1, colors.lightgrey),
             ('FONTNAME', (0, 0), (-1, -1), FONT_NAME),
-            ('FONTSIZE', (0, 0), (-1, -1), 9),
+            ('FONTSIZE', (0, 0), (-1, -1), 10),
+            ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor("#fff3e0")]),
         ]))
-        rt.wrapOn(c, 50, y)
-        rt.drawOn(c, 50, y - rt._height)
-        y -= rt._height + 20
-    # === НОВОЕ: ТАБЛИЦА АРБИТРАЖНЫХ ДЕЛ ===
+        rt.wrapOn(c, 45, y)
+        rt.drawOn(c, 45, y - rt._height)
+        y -= rt._height + 30
+
     arb_table_data = get_arbitration_cases_table(arbitration_data)
     if len(arb_table_data) > 1:
         c.setFont(FONT_NAME, 13)
         c.setFillColor(colors.red)
-        c.drawString(50, y, "⚖️ Арбитражные дела (последние)")
-        y -= 28
-        arb_table = Table(arb_table_data, colWidths=[70, 80, 130, 130, 90])
+        c.drawString(45, y, "⚖️ АРБИТРАЖНЫЕ ДЕЛА (последние)")
+        y -= 25
+        arb_table = Table(arb_table_data, colWidths=[72, 75, 125, 125, 85])
         arb_table.setStyle(TableStyle([
             ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor("#d32f2f")),
             ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
             ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
             ('GRID', (0, 0), (-1, -1), 1, colors.lightgrey),
             ('FONTNAME', (0, 0), (-1, -1), FONT_NAME),
-            ('FONTSIZE', (0, 0), (-1, -1), 8),
+            ('FONTSIZE', (0, 0), (-1, -1), 8.5),
             ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
         ]))
-        arb_table.wrapOn(c, 50, y)
-        arb_table.drawOn(c, 50, y - arb_table._height)
-        y -= arb_table._height + 25
-    # ЗАКЛЮЧЕНИЕ
-    c.setFont(FONT_NAME, 14)
+        arb_table.wrapOn(c, 45, y)
+        arb_table.drawOn(c, 45, y - arb_table._height)
+        y -= arb_table._height + 30
+
+    c.setStrokeColor(color)
+    c.setLineWidth(3)
+    c.roundRect(45, y - 75, 500, 85, 12, stroke=1, fill=0)
+    
     c.setFillColor(color)
-    c.drawString(50, y, "РЕКОМЕНДАЦИЯ OSINT PRO")
-    y -= 25
-    c.setFont(FONT_NAME, 11)
+    c.setFont(FONT_NAME, 15)
+    c.drawString(65, y - 25, "РЕКОМЕНДАЦИЯ OSINT PRO")
+    
     c.setFillColor(colors.black)
-    c.drawString(60, y, recommendation)
-    # ФУТЕР
+    c.setFont(FONT_NAME, 11)
+    y = draw_multiline(c, 65, y - 45, recommendation, font_size=11, max_width=460, line_height=16)
+
     c.setFont(FONT_NAME, 8)
     c.setFillColor(colors.grey)
-    footer = f"OSINT PRO v2.8 • Checko.ru + ЕГРЮЛ"
+    footer = f"OSINT PRO v2.8 • Конфиденциально • Данные на {datetime.now().strftime('%d.%m.%Y %H:%M')}"
     if cache_time:
         try:
             dt = datetime.fromisoformat(cache_time.replace("Z", "+00:00"))
             footer += f" • Кэш: {dt.strftime('%d.%m.%Y %H:%M')}"
         except:
             pass
-    c.drawString(50, 40, footer)
-    c.drawString(380, 40, "Конфиденциально")
+    c.drawString(45, 35, footer)
+    c.drawString(380, 35, "Для внутренних целей • Не для перепродажи")
+
     c.showPage()
     c.save()
     buffer.seek(0)
@@ -726,7 +835,7 @@ async def export_stats_to_excel() -> BytesIO:
         sub_df.to_excel(writer, sheet_name="Подписки", index=False)
     buffer.seek(0)
     return buffer
-# ================= MASS CHECK (ЭТАП 3) =================
+# ================= MASS CHECK =================
 async def handle_mass_check_document(message: Message):
     document = message.document
     if not document.file_name.lower().endswith(('.xlsx', '.csv')):
@@ -743,7 +852,6 @@ async def handle_mass_check_document(message: Message):
 
     wait_msg = await message.answer("📤 **Обрабатываю файл...**\nЭто может занять 30–120 секунд в зависимости от количества ИНН.")
 
-    # Скачиваем файл
     file = await bot.get_file(document.file_id)
     file_bytes = BytesIO()
     await bot.download_file(file.file_path, file_bytes)
@@ -758,7 +866,6 @@ async def handle_mass_check_document(message: Message):
         await wait_msg.edit_text("❌ Не удалось прочитать файл. Убедитесь, что формат корректный.")
         return
 
-    # Поиск колонки с ИНН
     inn_col = None
     for col in df.columns:
         col_str = str(col).lower()
@@ -767,18 +874,16 @@ async def handle_mass_check_document(message: Message):
             break
 
     if inn_col is None:
-        # Если не нашли — берём первую колонку
         df['inn'] = df.iloc[:, 0].astype(str).str.strip()
     else:
         df['inn'] = df[inn_col].astype(str).str.strip()
 
-    # Очищаем и валидируем ИНН
     inns = []
     for val in df['inn']:
         clean = re.sub(r'\D', '', str(val))
         if len(clean) in (10, 12):
             inns.append(clean)
-    inns = list(dict.fromkeys(inns))[:100]  # максимум 100, убираем дубли
+    inns = list(dict.fromkeys(inns))[:100]
 
     if not inns:
         await wait_msg.edit_text("❌ В файле не найдено валидных ИНН (10 или 12 цифр).")
@@ -816,14 +921,12 @@ async def handle_mass_check_document(message: Message):
             "Дата регистрации": calculate_age(data.get('ДатаРег', ''))
         })
 
-    # Создаём Excel-отчёт
     result_df = pd.DataFrame(results)
     excel_buffer = BytesIO()
     with pd.ExcelWriter(excel_buffer, engine='openpyxl') as writer:
         result_df.to_excel(writer, sheet_name="OSINT PRO — Массовый отчёт", index=False)
     excel_buffer.seek(0)
 
-    # Статистика
     total = len(results)
     risky = len([r for r in results if r["Индекс безопасности"] < 60])
     summary = (f"✅ **Массовый отчёт OSINT PRO готов!**\n\n"
@@ -845,7 +948,9 @@ async def cmd_start(message: Message):
             "✅ Таблицы в PDF • Арбитражные дела • ОКВЭД\n\n"
             "📌 **Новые возможности:**\n"
             "• Мониторинг изменений компаний (уведомления)\n"
-            "• Массовая проверка по Excel/CSV (до 100 ИНН)\n\n"
+            "• Массовая проверка по Excel/CSV (до 100 ИНН)\n"
+            "• **Премиум PDF** с современным дизайном\n"
+            "• **AI-анализ** каждого отчёта (вывод эксперта)\n\n"
             "Пришлите ИНН / ОГРН или название компании")
     if is_admin:
         text += "\n\n👑 **Админ-панель:** /admin"
@@ -885,7 +990,7 @@ async def admin_export(call: CallbackQuery):
 async def admin_pricing(call: CallbackQuery):
     if call.from_user.id != ADMIN_CHAT_ID: return await call.answer("⛔️ Доступ запрещён.")
     await call.answer()
-    await call.message.edit_text(f"💰 **Текущая цена подписки**\n\n{SUBSCRIPTION_PRICE}\n\nБезлимит + премиум-PDF")
+    await call.message.edit_text(f"💰 **Текущая цена подписки**\n\n{SUBSCRIPTION_PRICE}\n\nБезлимит + премиум-PDF + AI")
 @dp.callback_query(F.data == "admin_grant")
 async def admin_grant_start(call: CallbackQuery):
     if call.from_user.id != ADMIN_CHAT_ID: return await call.answer("⛔️ Доступ запрещён.")
@@ -905,7 +1010,7 @@ async def handle_search(message: Message):
         if not can_use:
             kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="💰 Купить подписку", callback_data="buy")]])
             return await message.answer("🛑 Лимит 3 запроса в день исчерпан.", reply_markup=kb)
-        wait = await message.answer("🔍 Запрашиваю данные...")
+        wait = await message.answer("🔍 Запрашиваю данные + AI-анализ...")
         data, arbitration_data, cache_time = await get_company_data(inn)
         if not data:
             return await wait.edit_text("❌ Данные по ИНН не найдены.")
@@ -913,7 +1018,9 @@ async def handle_search(message: Message):
         await log_usage(message.from_user.id, inn, score, is_premium)
         log_to_sheet(message.from_user.id, inn, score)
 
-        # === МОНИТОРИНГ: проверяем, уже ли в списке ===
+        # === AI-АНАЛИЗ (ТОП-2) ===
+        ai_summary = await get_ai_summary(data, score, risks, recommendation, arbitration_data)
+
         is_mon = await is_monitored(message.from_user.id, inn)
         monitor_text = "❌ Убрать из мониторинга" if is_mon else "📌 Добавить в мониторинг"
         monitor_cb = f"monitor_remove_{inn}" if is_mon else f"monitor_add_{inn}"
@@ -935,6 +1042,7 @@ async def handle_search(message: Message):
             res += f"📞 Контакты: {len(data.get('Контакты', []))} шт.\n"
         res += f"\n🛡️ **Индекс безопасности:** `{score}/100`\n"
         res += f"📌 **Рекомендация:** {recommendation}\n\n"
+        res += f"{ai_summary}\n\n"   # ← AI-блок
         if not is_premium:
             res += f"Осталось бесплатных запросов: **{remaining}/3**\n\n"
         res += "📄 **Полный профессиональный отчёт в PDF**"
@@ -1013,7 +1121,6 @@ async def handle_refresh(call: CallbackQuery):
         await db.execute("DELETE FROM cache WHERE inn = ?", (inn,))
         await db.commit()
     await call.message.answer("✅ **Кэш очищен!** Пришлите ИНН / ОГРН ещё раз.")
-# ================= НОВЫЕ CALLBACK'И МОНИТОРИНГА =================
 @dp.callback_query(F.data.startswith("monitor_add_"))
 async def handle_monitor_add(call: CallbackQuery):
     inn = call.data.split("_", 2)[2]
@@ -1028,14 +1135,13 @@ async def handle_monitor_remove(call: CallbackQuery):
     inn = call.data.split("_", 2)[2]
     await remove_from_monitoring(call.from_user.id, inn)
     await call.answer("✅ Убрано из мониторинга")
-# ================= MASS CHECK DOCUMENT HANDLER =================
 @dp.message(F.document)
 async def handle_document(message: Message):
     await handle_mass_check_document(message)
 @dp.callback_query(F.data == "buy")
 async def buy_subscription(call: CallbackQuery):
     await call.answer()
-    await call.message.answer(f"💰 **Подписка OSINT PRO**\n\nБезлимит + премиум-отчёты — {SUBSCRIPTION_PRICE}\n\nПосле оплаты напишите @ваш_логин с чеком.")
+    await call.message.answer(f"💰 **Подписка OSINT PRO**\n\nБезлимит + премиум-PDF + AI-анализ — {SUBSCRIPTION_PRICE}\n\nПосле оплаты напишите @ваш_логин с чеком.")
 @dp.message(Command("history"))
 async def cmd_history(message: Message):
     try:
@@ -1091,7 +1197,7 @@ async def cmd_stats(message: Message):
 @dp.message(Command("pricing"))
 async def cmd_pricing(message: Message):
     if message.from_user.id != ADMIN_CHAT_ID: return await message.answer("⛔️ Доступ запрещён.")
-    await message.answer(f"💰 **Текущая цена подписки**\n\n{SUBSCRIPTION_PRICE}\n\nБезлимит + премиум-PDF")
+    await message.answer(f"💰 **Текущая цена подписки**\n\n{SUBSCRIPTION_PRICE}\n\nБезлимит + премиум-PDF + AI-анализ")
 # ================= WEBHOOK =================
 async def health_handler(request):
     return web.Response(text="OK", status=200)
@@ -1106,11 +1212,10 @@ async def webhook_handler(request):
         return web.Response(text="OK", status=200)
 async def main():
     await init_db()
-    # Запускаем мониторинг в фоне (ЭТАП 2)
     asyncio.create_task(monitoring_scheduler())
     await bot.delete_webhook(drop_pending_updates=True)
     await bot.set_webhook(url=WEBHOOK_URL)
-    logger.info("🚀 OSINT PRO v2.8-fix запущен с МОНИТОРИНГОМ компаний + МАССОВОЙ проверкой по Excel!")
+    logger.info("🚀 OSINT PRO v2.8-fix запущен с AI-анализом отчёта + премиум PDF + мониторинг + массовая проверка!")
     app = web.Application()
     app.router.add_get("/", health_handler)
     app.router.add_post("/webhook", webhook_handler)
@@ -1118,7 +1223,7 @@ async def main():
     await runner.setup()
     site = web.TCPSite(runner, '0.0.0.0', int(os.environ.get("PORT", 10000)))
     await site.start()
-    logger.info("✅ Webhook установлен + мониторинг запущен")
+    logger.info("✅ Webhook установлен + AI + мониторинг запущены")
     await asyncio.Event().wait()
 if __name__ == "__main__":
     asyncio.run(main())
