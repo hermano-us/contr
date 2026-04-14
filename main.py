@@ -19,7 +19,6 @@ from reportlab.pdfgen import canvas
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.lib import colors
-
 # ================= CONFIG =================
 TOKEN = os.environ.get("TOKEN")
 ADMIN_CHAT_ID = int(os.environ.get("ADMIN_CHAT_ID", 0))
@@ -41,25 +40,17 @@ if CHECKO_API_KEY:
 else:
     logger.warning("⚠️ CHECKO_API_KEY не задан — арбитраж отключён")
 
-# ================= FONT + DEBUG =================
+# ================= FONT =================
 FONT_NAME = "DejaVuSans"
 FONT_PATH = "DejaVuSans.ttf"
-
-logger.info(f"📂 Рабочая директория: {os.getcwd()}")
-logger.info(f"📄 Файлы в корне: {os.listdir('.')}")
-
 if os.path.exists(FONT_PATH):
-    try:
-        pdfmetrics.registerFont(TTFont(FONT_NAME, FONT_PATH))
-        logger.info("✅ Шрифт DejaVuSans.ttf успешно загружен")
-    except Exception as e:
-        logger.error(f"❌ Ошибка регистрации шрифта: {e}")
-        FONT_NAME = "Helvetica"
+    pdfmetrics.registerFont(TTFont(FONT_NAME, FONT_PATH))
+    logger.info("✅ Шрифт DejaVuSans загружен")
 else:
-    logger.error("❌ DejaVuSans.ttf НЕ НАЙДЕН! PDF может падать.")
+    logger.error("❌ DejaVuSans.ttf не найден!")
     FONT_NAME = "Helvetica"
 
-# ================= DATABASE =================
+# ================= DATABASE, SHEETS, HELPERS =================
 async def init_db():
     async with aiosqlite.connect(DB_NAME) as db:
         await db.execute('''CREATE TABLE IF NOT EXISTS usage_log
@@ -87,7 +78,6 @@ async def log_usage(user_id: int):
         await db.execute("INSERT INTO usage_log (user_id) VALUES (?)", (user_id,))
         await db.commit()
 
-# ================= GOOGLE SHEETS =================
 gc = None
 if GOOGLE_CREDENTIALS and SHEET_ID:
     try:
@@ -106,19 +96,10 @@ def log_to_sheet(user_id, inn, score: int):
         sh = gc.open_by_key(SHEET_ID)
         worksheet = sh.sheet1
         now = datetime.now()
-        worksheet.append_row([
-            now.strftime("%d.%m.%Y %H:%M:%S"),
-            str(user_id),
-            inn,
-            f"score:{score}",
-            "Бесплатный",
-            now.strftime("%H:%M:%S")
-        ])
-        logger.info(f"✅ Запись в Google Sheets: {user_id} | {inn} | score:{score}")
+        worksheet.append_row([now.strftime("%d.%m.%Y %H:%M:%S"), str(user_id), inn, f"score:{score}", "Бесплатный", now.strftime("%H:%M:%S")])
     except Exception as e:
         logger.error(f"Sheet write error: {e}")
 
-# ================= HELPERS =================
 def calculate_age(reg_date_str: str) -> str:
     if not reg_date_str:
         return "Н/Д"
@@ -162,25 +143,17 @@ def get_risk_assessment(data: dict, arbitration_data: dict | None = None):
     warnings = []
     mass_flags = []
 
-    # Возраст
+    # ... (весь предыдущий код risk assessment без изменений) ...
     reg_date_str = data.get('reg_date', '')
     if reg_date_str:
         try:
             reg_date = datetime.strptime(reg_date_str, '%Y-%m-%d')
             years = (datetime.now() - reg_date).days / 365.25
-            if years < 0.5:
-                score -= 50
-                risk_factors.append("🚨 Крайне молодая компания (менее 6 месяцев)")
-            elif years < 1:
-                score -= 35
-                risk_factors.append("⚠️ Критическая новизна: компания меньше года")
-            elif years < 3:
-                score -= 15
-                risk_factors.append("🟡 Молодая компания (менее 3 лет)")
-        except:
-            pass
+            if years < 0.5: score -= 50; risk_factors.append("🚨 Крайне молодая компания (менее 6 месяцев)")
+            elif years < 1: score -= 35; risk_factors.append("⚠️ Критическая новизна: компания меньше года")
+            elif years < 3: score -= 15; risk_factors.append("🟡 Молодая компания (менее 3 лет)")
+        except: pass
 
-    # Массовость
     if data.get('invalid_address') == 1:
         score -= 40
         risk_factors.append("🚨 Недостоверный / массовый адрес")
@@ -197,13 +170,11 @@ def get_risk_assessment(data: dict, arbitration_data: dict | None = None):
         warnings.append(data.get('invalid_chief_msg', 'Массовый руководитель'))
         mass_flags.append("Руководитель")
 
-    # Статус
     status_lower = str(data.get('status') or data.get('status_text') or data.get('sv_status_msg', '')).lower()
     if any(x in status_lower for x in ["ликвидац", "банкрот", "прекращ", "недейств"]):
         score -= 80
         risk_factors.append("🚨 ОПАСНО: ликвидация / банкротство / недействующий статус")
 
-    # Арбитраж
     arb_count = 0
     if arbitration_data and isinstance(arbitration_data, dict):
         arb_count = arbitration_data.get("total", 0) or len(arbitration_data.get("cases", []))
@@ -219,10 +190,9 @@ def get_risk_assessment(data: dict, arbitration_data: dict | None = None):
 
     return score, risk_factors, warnings, color, recommendation, arbitration_data, mass_flags
 
-# ================= PDF =================
+# ================= ПРОФЕССИОНАЛЬНЫЙ PDF v2.5 =================
 def draw_multiline(c, x, y, text, font_size=10, max_width=480, line_height=14):
-    if not text:
-        return y
+    if not text: return y
     words = str(text).split()
     line = ""
     for word in words:
@@ -241,85 +211,109 @@ def create_pro_pdf(data: dict, score: int, risks: list, warnings: list, color: c
                    recommendation: str, arbitration_data: dict | None, mass_flags: list):
     buffer = BytesIO()
     c = canvas.Canvas(buffer, pagesize=A4)
-    y = A4[1] - 70
+    y = A4[1] - 50
 
-    # HEADER
+    # ШАПКА
     c.setFillColor(colors.HexColor("#1a237e"))
-    c.setFont(FONT_NAME, 26)
-    c.drawString(50, y, "OSINT PRO v2.4")
-    c.setFont(FONT_NAME, 11)
+    c.setFont(FONT_NAME, 28)
+    c.drawString(50, y, "OSINT PRO v2.5")
+    c.setFont(FONT_NAME, 12)
     c.setFillColor(colors.grey)
-    c.drawString(50, y - 22, f"Аналитический отчёт • {datetime.now().strftime('%d.%m.%Y %H:%M')}")
-    y -= 70
+    c.drawString(50, y - 28, f"ПРОФЕССИОНАЛЬНЫЙ АНАЛИТИЧЕСКИЙ ОТЧЁТ • {datetime.now().strftime('%d.%m.%Y %H:%M')}")
+    y -= 75
 
-    # Индекс безопасности
+    # Название компании
+    full_name = data.get('full_name') or data.get('short_name') or "Н/Д"
+    c.setFont(FONT_NAME, 18)
+    c.setFillColor(colors.black)
+    y = draw_multiline(c, 50, y, full_name, font_size=18, max_width=480, line_height=22)
+    y -= 35
+
+    # ИНДЕКС БЕЗОПАСНОСТИ
     c.setFont(FONT_NAME, 14)
     c.setFillColor(colors.black)
     c.drawString(50, y, "ИНДЕКС БЕЗОПАСНОСТИ")
     c.setStrokeColor(colors.lightgrey)
-    c.roundRect(50, y - 32, 240, 28, 8, stroke=1, fill=0)
+    c.roundRect(50, y - 38, 250, 38, 8, stroke=1, fill=0)
     c.setFillColor(color)
-    c.roundRect(50, y - 32, 2.4 * score, 28, 8, stroke=0, fill=1)
+    c.roundRect(50, y - 38, 2.4 * score, 38, 8, stroke=0, fill=1)
     c.setFillColor(colors.black)
-    c.setFont(FONT_NAME, 22)
-    c.drawString(310, y - 25, f"{score} / 100")
-    y -= 80
+    c.setFont(FONT_NAME, 28)
+    c.drawString(320, y - 32, f"{score}/100")
+    y -= 75
 
-    # Статус, реквизиты, массовость, предупреждения, арбитраж, риски — всё как раньше
-    # (код оставлен полностью идентичным предыдущей версии, только добавлен параметр recommendation)
-
+    # СТАТУС
     status_text, status_emoji = get_company_status(data)
-    c.setFont(FONT_NAME, 15)
+    c.setFont(FONT_NAME, 14)
     c.setFillColor(colors.black)
     c.drawString(50, y, "Статус компании")
-    c.setFillColor(colors.red if "ликвидац" in status_text.lower() or "банкрот" in status_text.lower() else colors.green)
+    c.setFillColor(colors.green if status_emoji == "✅" else colors.red)
     c.drawString(220, y, f"{status_emoji} {status_text}")
     y -= 45
 
+    # КЛЮЧЕВЫЕ ФАКТЫ (расширенный блок)
     c.setFont(FONT_NAME, 13)
     c.setFillColor(colors.black)
-    c.drawString(50, y, "Основные реквизиты")
+    c.drawString(50, y, "Ключевые факты")
     y -= 25
     c.setFont(FONT_NAME, 10)
     c.setFillColor(colors.grey)
-    company_name = data.get('short_name') or data.get('full_name') or data.get('name') or "Н/Д"
+
     director = f"{data.get('chief_position', '')} {data.get('chief', 'Н/Д')}".strip() or "Н/Д"
+    branches_count = len(data.get('branches', {})) if isinstance(data.get('branches'), dict) else 0
+
     fields = [
-        ("Полное наименование", company_name),
-        ("ИНН", data.get('inn', "Н/Д")),
-        ("ОГРН", data.get('ogrn', "Н/Д")),
-        ("КПП", data.get('kpp', "Н/Д")),
+        ("Полное наименование", full_name),
+        ("Сокращённое", data.get('short_name', '—')),
+        ("ИНН", data.get('inn', '—')),
+        ("ОГРН", data.get('ogrn', '—')),
+        ("КПП", data.get('kpp', '—')),
         ("Руководитель", director),
-        ("Дата регистрации", data.get('reg_date', "Н/Д")),
-        ("Адрес", data.get('address', "Информация ограничена"))
+        ("Дата регистрации", calculate_age(data.get('reg_date', ''))),
+        ("Адрес", data.get('address', 'Информация ограничена')),
+        ("Уставный капитал", data.get('capital', '—')),
+        ("Основной ОКВЭД", data.get('main_okved', data.get('okved', '—'))),
+        ("Филиалы", f"{branches_count} шт." if branches_count else "—"),
     ]
+
     for label, value in fields:
-        c.drawString(50, y, label + ":")
-        y = draw_multiline(c, 210, y, value, font_size=10, max_width=340)
+        c.drawString(50, y, f"{label}:")
+        y = draw_multiline(c, 210, y, str(value), max_width=340)
         y -= 8
     y -= 20
 
-    if mass_flags:
+    # ФИЛИАЛЫ (новый профессиональный блок)
+    if branches_count > 0:
+        c.setFont(FONT_NAME, 13)
+        c.setFillColor(colors.blue)
+        c.drawString(50, y, "🌳 Филиалы и подразделения")
+        y -= 22
+        c.setFont(FONT_NAME, 9)
+        c.setFillColor(colors.black)
+        branch_list = list(data['branches'].values())[:5]  # первые 5 для PDF
+        for b in branch_list:
+            name = b.get('full_name', '—')
+            addr = b.get('uraddress', '—')
+            y = draw_multiline(c, 60, y, f"• {name} — {addr}", max_width=480)
+            y -= 4
+        if branches_count > 5:
+            y = draw_multiline(c, 60, y, f"...и ещё {branches_count - 5} филиалов", max_width=480)
+        y -= 15
+
+    # МАССОВОСТЬ И ПРЕДУПРЕЖДЕНИЯ ЕГРЮЛ
+    if mass_flags or warnings:
         c.setFont(FONT_NAME, 13)
         c.setFillColor(colors.orange)
-        c.drawString(50, y, "⚠️ Массовость сведений ЕГРЮЛ")
-        y -= 22
-        c.setFont(FONT_NAME, 10)
-        c.setFillColor(colors.black)
-        c.drawString(60, y, f"Обнаружена массовость по: {', '.join(mass_flags)}")
-        y -= 30
-
-    if warnings:
-        c.setFont(FONT_NAME, 13)
-        c.setFillColor(colors.red)
-        c.drawString(50, y, "🚨 Критические предупреждения ЕГРЮЛ")
+        c.drawString(50, y, "⚠️ Массовость и недостоверность сведений ЕГРЮЛ")
         y -= 22
         c.setFont(FONT_NAME, 10)
         c.setFillColor(colors.black)
         for w in warnings:
             y = draw_multiline(c, 60, y, f"• {w}", max_width=480)
-        y -= 15
+            y -= 6
+        y -= 10
 
+    # АРБИТРАЖ
     if arbitration_data and isinstance(arbitration_data, dict):
         arb_count = arbitration_data.get("total", 0) or len(arbitration_data.get("cases", []))
         if arb_count > 0:
@@ -328,32 +322,33 @@ def create_pro_pdf(data: dict, score: int, risks: list, warnings: list, color: c
             c.drawString(50, y, f"⚖️ Арбитражные дела — {arb_count} шт.")
             y -= 30
 
+    # РИСКИ И ЗАКЛЮЧЕНИЕ
     c.setFont(FONT_NAME, 13)
     c.setFillColor(colors.black)
-    c.drawString(50, y, "Заключение экспертизы и риски")
-    y -= 25
+    c.drawString(50, y, "Экспертное заключение и риски")
+    y -= 22
     c.setFont(FONT_NAME, 10)
     c.setFillColor(colors.black)
     for risk in risks:
         y = draw_multiline(c, 60, y, f"• {risk}", max_width=480)
-        y -= 4
+        y -= 6
 
-    # Рекомендация
+    # РЕКОМЕНДАЦИЯ
     y -= 20
     c.setFont(FONT_NAME, 14)
     c.setFillColor(color)
     c.drawString(50, y, "РЕКОМЕНДАЦИЯ OSINT PRO")
-    y -= 22
+    y -= 25
     c.setFont(FONT_NAME, 11)
     c.setFillColor(colors.black)
     c.drawString(60, y, recommendation)
-    y -= 40
+    y -= 55
 
-    # FOOTER
+    # ФУТЕР
     c.setFont(FONT_NAME, 8)
     c.setFillColor(colors.grey)
-    c.drawString(50, 40, f"OSINT PRO v2.4 • Источники: ЕГРЮЛ, Checko.ru • {datetime.now().strftime('%d.%m.%Y')}")
-    c.drawString(400, 40, "Конфиденциально")
+    c.drawString(50, 40, f"OSINT PRO v2.5 • Данные: ЕГРЮЛ (egrul.org) + Checko.ru • {datetime.now().strftime('%d.%m.%Y')}")
+    c.drawString(380, 40, "Конфиденциально • Для служебного использования")
     c.showPage()
     c.save()
     buffer.seek(0)
@@ -362,12 +357,7 @@ def create_pro_pdf(data: dict, score: int, risks: list, warnings: list, color: c
 # ================= HANDLERS =================
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
-    await message.answer(
-        "🚀 **OSINT PRO v2.4**\n\n"
-        "Пришлите ИНН или ОГРН.\n"
-        "Полный профессиональный отчёт с массовостью, арбитражем и расширенным PDF.",
-        parse_mode=ParseMode.MARKDOWN
-    )
+    await message.answer("🚀 **OSINT PRO v2.5**\n\nПришлите ИНН или ОГРН.\n**Профессиональный** отчёт с филиалами, массовостью, арбитражем и расширенным PDF.", parse_mode=ParseMode.MARKDOWN)
 
 @dp.message(F.text)
 async def handle_search(message: Message):
@@ -380,7 +370,7 @@ async def handle_search(message: Message):
         kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="💰 Купить подписку", callback_data="buy")]])
         return await message.answer("🛑 Лимит 3 запроса в день исчерпан.", reply_markup=kb)
 
-    wait = await message.answer("🔍 Глубокий анализ ЕГРЮЛ + арбитраж...")
+    wait = await message.answer("🔍 Глубокий профессиональный анализ ЕГРЮЛ + арбитраж...")
 
     async with aiohttp.ClientSession() as session:
         egrul_task = session.get(f"https://egrul.org/short_data/?id={inn}")
@@ -397,37 +387,39 @@ async def handle_search(message: Message):
     log_to_sheet(message.from_user.id, inn, score)
 
     status_text, status_emoji = get_company_status(data)
-    company_name = data.get('short_name') or data.get('full_name') or data.get('name') or '—'
+    company_name = data.get('short_name') or data.get('full_name') or '—'
     director_info = f"{data.get('chief_position', '')} {data.get('chief', 'Н/Д')}".strip() or "Н/Д"
+    branches_count = len(data.get('branches', {})) if isinstance(data.get('branches'), dict) else 0
 
-    res = (
-        f"✅ **OSINT PRO v2.4**\n\n"
-        f"🏢 `{company_name}`\n"
-        f"📋 ИНН `{data.get('inn', inn)}` | ОГРН `{data.get('ogrn', 'Н/Д')}` | КПП `{data.get('kpp', 'Н/Д')}`\n\n"
-        f"📌 **Статус:** {status_emoji} {status_text}\n"
-        f"📅 Зарегистрирована {calculate_age(data.get('reg_date', ''))}\n"
-        f"👤 Руководитель: {director_info}\n"
-        f"📍 {data.get('address', 'Информация ограничена')[:140]}\n\n"
-        f"🛡️ **Индекс безопасности:** `{score}/100`\n"
-        f"📌 **Рекомендация:** {recommendation}\n\n"
-        f"Осталось бесплатных запросов сегодня: **{remaining}/3**\n\n"
-    )
+    res = (f"✅ **OSINT PRO v2.5**\n\n"
+           f"🏢 `{company_name}`\n"
+           f"📋 ИНН `{data.get('inn', inn)}` | ОГРН `{data.get('ogrn', 'Н/Д')}` | КПП `{data.get('kpp', 'Н/Д')}`\n\n"
+           f"📌 **Статус:** {status_emoji} {status_text}\n"
+           f"📅 Зарегистрирована {calculate_age(data.get('reg_date', ''))}\n"
+           f"👤 Руководитель: {director_info}\n"
+           f"📍 {data.get('address', 'Информация ограничена')[:140]}\n"
+           f"🌳 **Филиалы:** {branches_count} шт.\n\n"
+           f"🛡️ **Индекс безопасности:** `{score}/100`\n"
+           f"📌 **Рекомендация:** {recommendation}\n\n"
+           f"Осталось бесплатных запросов сегодня: **{remaining}/3**\n\n")
+
     if mass_flags:
         res += f"⚠️ **Массовость:** по {', '.join(mass_flags)}\n"
     if arbitration_data:
         arb_count = arbitration_data.get("total", 0) or len(arbitration_data.get("cases", []))
         if arb_count > 0:
             res += f"⚖️ **Арбитраж:** {arb_count} дел\n"
-    res += "\n📄 **Полный профессиональный отчёт в PDF**"
 
+    res += "\n📄 **Полный профессиональный отчёт в PDF**"
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="📥 Скачать PDF", callback_data=f"pdf_{inn}")]])
+
     await wait.delete()
     await message.answer(res, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
 
 @dp.callback_query(F.data.startswith("pdf_"))
 async def send_pdf(call: CallbackQuery):
     inn = call.data.split("_", 1)[1]
-    await call.answer("Генерирую подробный PDF-отчёт...")
+    await call.answer("Генерирую подробный профессиональный PDF-отчёт...")
 
     try:
         async with aiohttp.ClientSession() as session:
@@ -437,52 +429,27 @@ async def send_pdf(call: CallbackQuery):
                 data = await resp.json(content_type=None)
 
         if not isinstance(data, dict) or not data:
-            raise ValueError("Получены некорректные данные от egrul.org")
+            raise ValueError("Некорректные данные")
 
         arbitration_data = await get_arbitration_data(inn) if CHECKO_API_KEY else None
+        score, risks, warnings, color, recommendation, arbitration_data, mass_flags = get_risk_assessment(data, arbitration_data)
 
-        # ←←← ИСПРАВЛЕНИЕ ЗДЕСЬ
-        score, risks, warnings, color, recommendation, arbitration_data, mass_flags = get_risk_assessment(
-            data, arbitration_data
-        )
-
-        pdf_buffer = create_pro_pdf(
-            data, score, risks, warnings, color, recommendation, arbitration_data, mass_flags
-        )
+        pdf_buffer = create_pro_pdf(data, score, risks, warnings, color, recommendation, arbitration_data, mass_flags)
 
         await call.message.answer_document(
-            BufferedInputFile(pdf_buffer.read(), filename=f"OSINT_PRO_{inn}.pdf"),
-            caption="✅ Подробный аналитический отчёт OSINT PRO v2.4"
+            BufferedInputFile(pdf_buffer.read(), filename=f"OSINT_PRO_{inn}_v2.5.pdf"),
+            caption="✅ Подробный профессиональный отчёт OSINT PRO v2.5"
         )
-
     except Exception as e:
-        logger.error(f"PDF generation error for INN {inn} | User {call.from_user.id}", exc_info=True)
-        await call.message.answer(
-            "❌ Не удалось сгенерировать PDF-отчёт.\n"
-            "Попробуйте позже или напишите администратору."
-        )
-        if ADMIN_CHAT_ID:
-            try:
-                await bot.send_message(
-                    ADMIN_CHAT_ID,
-                    f"❌ Ошибка PDF!\n"
-                    f"ИНН: {inn}\n"
-                    f"Пользователь: {call.from_user.id} (@{call.from_user.username or '—'})\n"
-                    f"Ошибка: {type(e).__name__}: {e}"
-                )
-            except:
-                pass
+        logger.error(f"PDF error INN {inn}", exc_info=True)
+        await call.message.answer("❌ Не удалось сгенерировать PDF. Попробуйте позже.")
 
 @dp.callback_query(F.data == "buy")
 async def buy_subscription(call: CallbackQuery):
     await call.answer()
-    await call.message.answer(
-        "💰 **Подписка OSINT PRO**\n\n"
-        "Безлимит + приоритетные отчёты — 4900 ₽/мес\n\n"
-        "Напишите @ваш_логин для оплаты"
-    )
+    await call.message.answer("💰 **Подписка OSINT PRO**\n\nБезлимит + приоритетные отчёты — 4900 ₽/мес\n\nНапишите @ваш_логин для оплаты")
 
-# ================= WEBHOOK =================
+# ================= WEBHOOK & MAIN =================
 async def health_handler(request):
     return web.Response(text="OK", status=200)
 
@@ -496,7 +463,6 @@ async def webhook_handler(request):
         logger.error(f"Webhook error: {e}")
         return web.Response(text="OK", status=200)
 
-# ================= MAIN =================
 async def main():
     await init_db()
     await bot.delete_webhook(drop_pending_updates=True)
@@ -509,7 +475,7 @@ async def main():
     await runner.setup()
     site = web.TCPSite(runner, '0.0.0.0', int(os.environ.get("PORT", 10000)))
     await site.start()
-    logger.info("🚀 OSINT PRO v2.4 запущен!")
+    logger.info("🚀 OSINT PRO v2.5 запущен!")
     await asyncio.Event().wait()
 
 if __name__ == "__main__":
