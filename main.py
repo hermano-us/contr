@@ -41,20 +41,22 @@ if CHECKO_API_KEY:
 else:
     logger.warning("⚠️ CHECKO_API_KEY не задан — арбитраж отключён")
 
-# ================= FONT =================
+# ================= FONT + DEBUG =================
 FONT_NAME = "DejaVuSans"
 FONT_PATH = "DejaVuSans.ttf"
+
+logger.info(f"📂 Рабочая директория: {os.getcwd()}")
+logger.info(f"📄 Файлы в корне: {os.listdir('.')}")
 
 if os.path.exists(FONT_PATH):
     try:
         pdfmetrics.registerFont(TTFont(FONT_NAME, FONT_PATH))
-        logger.info("✅ Шрифт DejaVuSans загружен успешно")
+        logger.info("✅ Шрифт DejaVuSans.ttf успешно загружен")
     except Exception as e:
-        logger.error(f"❌ Ошибка регистрации шрифта DejaVuSans: {e}")
+        logger.error(f"❌ Ошибка регистрации шрифта: {e}")
         FONT_NAME = "Helvetica"
 else:
-    logger.warning("⚠️ Файл DejaVuSans.ttf НЕ НАЙДЕН в корне проекта! "
-                   "PDF с русским текстом может падать. Загрузи шрифт на Render.com")
+    logger.error("❌ DejaVuSans.ttf НЕ НАЙДЕН! PDF может падать.")
     FONT_NAME = "Helvetica"
 
 # ================= DATABASE =================
@@ -73,7 +75,7 @@ async def check_limit(user_id: int) -> tuple[bool, int]:
                 (user_id, today)
             ) as cursor:
                 row = await cursor.fetchone()
-                used = row[0]
+                used = row[0] if row else 0
                 remaining = max(0, FREE_LIMIT - used)
                 return used < FREE_LIMIT, remaining
     except Exception as e:
@@ -178,7 +180,7 @@ def get_risk_assessment(data: dict, arbitration_data: dict | None = None):
         except:
             pass
 
-    # Массовость и недостоверность
+    # Массовость
     if data.get('invalid_address') == 1:
         score -= 40
         risk_factors.append("🚨 Недостоверный / массовый адрес")
@@ -217,7 +219,7 @@ def get_risk_assessment(data: dict, arbitration_data: dict | None = None):
 
     return score, risk_factors, warnings, color, recommendation, arbitration_data, mass_flags
 
-# ================= УЛУЧШЕННЫЙ PDF =================
+# ================= PDF =================
 def draw_multiline(c, x, y, text, font_size=10, max_width=480, line_height=14):
     if not text:
         return y
@@ -236,11 +238,10 @@ def draw_multiline(c, x, y, text, font_size=10, max_width=480, line_height=14):
     return y
 
 def create_pro_pdf(data: dict, score: int, risks: list, warnings: list, color: colors,
-                   arbitration_data: dict | None, mass_flags: list):
+                   recommendation: str, arbitration_data: dict | None, mass_flags: list):
     buffer = BytesIO()
     c = canvas.Canvas(buffer, pagesize=A4)
-    w, h = A4
-    y = h - 70
+    y = A4[1] - 70
 
     # HEADER
     c.setFillColor(colors.HexColor("#1a237e"))
@@ -251,7 +252,7 @@ def create_pro_pdf(data: dict, score: int, risks: list, warnings: list, color: c
     c.drawString(50, y - 22, f"Аналитический отчёт • {datetime.now().strftime('%d.%m.%Y %H:%M')}")
     y -= 70
 
-    # ИНДЕКС БЕЗОПАСНОСТИ
+    # Индекс безопасности
     c.setFont(FONT_NAME, 14)
     c.setFillColor(colors.black)
     c.drawString(50, y, "ИНДЕКС БЕЗОПАСНОСТИ")
@@ -264,7 +265,9 @@ def create_pro_pdf(data: dict, score: int, risks: list, warnings: list, color: c
     c.drawString(310, y - 25, f"{score} / 100")
     y -= 80
 
-    # СТАТУС
+    # Статус, реквизиты, массовость, предупреждения, арбитраж, риски — всё как раньше
+    # (код оставлен полностью идентичным предыдущей версии, только добавлен параметр recommendation)
+
     status_text, status_emoji = get_company_status(data)
     c.setFont(FONT_NAME, 15)
     c.setFillColor(colors.black)
@@ -273,7 +276,6 @@ def create_pro_pdf(data: dict, score: int, risks: list, warnings: list, color: c
     c.drawString(220, y, f"{status_emoji} {status_text}")
     y -= 45
 
-    # РЕКВИЗИТЫ
     c.setFont(FONT_NAME, 13)
     c.setFillColor(colors.black)
     c.drawString(50, y, "Основные реквизиты")
@@ -297,7 +299,6 @@ def create_pro_pdf(data: dict, score: int, risks: list, warnings: list, color: c
         y -= 8
     y -= 20
 
-    # МАССОВОСТЬ
     if mass_flags:
         c.setFont(FONT_NAME, 13)
         c.setFillColor(colors.orange)
@@ -308,7 +309,6 @@ def create_pro_pdf(data: dict, score: int, risks: list, warnings: list, color: c
         c.drawString(60, y, f"Обнаружена массовость по: {', '.join(mass_flags)}")
         y -= 30
 
-    # ПРЕДУПРЕЖДЕНИЯ
     if warnings:
         c.setFont(FONT_NAME, 13)
         c.setFillColor(colors.red)
@@ -320,7 +320,6 @@ def create_pro_pdf(data: dict, score: int, risks: list, warnings: list, color: c
             y = draw_multiline(c, 60, y, f"• {w}", max_width=480)
         y -= 15
 
-    # АРБИТРАЖ
     if arbitration_data and isinstance(arbitration_data, dict):
         arb_count = arbitration_data.get("total", 0) or len(arbitration_data.get("cases", []))
         if arb_count > 0:
@@ -329,7 +328,6 @@ def create_pro_pdf(data: dict, score: int, risks: list, warnings: list, color: c
             c.drawString(50, y, f"⚖️ Арбитражные дела — {arb_count} шт.")
             y -= 30
 
-    # ЗАКЛЮЧЕНИЕ И РИСКИ
     c.setFont(FONT_NAME, 13)
     c.setFillColor(colors.black)
     c.drawString(50, y, "Заключение экспертизы и риски")
@@ -340,7 +338,7 @@ def create_pro_pdf(data: dict, score: int, risks: list, warnings: list, color: c
         y = draw_multiline(c, 60, y, f"• {risk}", max_width=480)
         y -= 4
 
-    # РЕКОМЕНДАЦИЯ
+    # Рекомендация
     y -= 20
     c.setFont(FONT_NAME, 14)
     c.setFillColor(color)
@@ -443,11 +441,14 @@ async def send_pdf(call: CallbackQuery):
 
         arbitration_data = await get_arbitration_data(inn) if CHECKO_API_KEY else None
 
-        score, risks, warnings, color, _, arbitration_data, mass_flags = get_risk_assessment(
+        # ←←← ИСПРАВЛЕНИЕ ЗДЕСЬ
+        score, risks, warnings, color, recommendation, arbitration_data, mass_flags = get_risk_assessment(
             data, arbitration_data
         )
 
-        pdf_buffer = create_pro_pdf(data, score, risks, warnings, color, arbitration_data, mass_flags)
+        pdf_buffer = create_pro_pdf(
+            data, score, risks, warnings, color, recommendation, arbitration_data, mass_flags
+        )
 
         await call.message.answer_document(
             BufferedInputFile(pdf_buffer.read(), filename=f"OSINT_PRO_{inn}.pdf"),
@@ -456,12 +457,10 @@ async def send_pdf(call: CallbackQuery):
 
     except Exception as e:
         logger.error(f"PDF generation error for INN {inn} | User {call.from_user.id}", exc_info=True)
-        
         await call.message.answer(
             "❌ Не удалось сгенерировать PDF-отчёт.\n"
             "Попробуйте позже или напишите администратору."
         )
-        
         if ADMIN_CHAT_ID:
             try:
                 await bot.send_message(
@@ -483,7 +482,7 @@ async def buy_subscription(call: CallbackQuery):
         "Напишите @ваш_логин для оплаты"
     )
 
-# ================= WEBHOOK & HEALTH =================
+# ================= WEBHOOK =================
 async def health_handler(request):
     return web.Response(text="OK", status=200)
 
@@ -503,7 +502,6 @@ async def main():
     await bot.delete_webhook(drop_pending_updates=True)
     await bot.set_webhook(url=WEBHOOK_URL)
     logger.info(f"✅ Webhook установлен: {WEBHOOK_URL}")
-
     app = web.Application()
     app.router.add_get("/", health_handler)
     app.router.add_post("/webhook", webhook_handler)
@@ -511,7 +509,7 @@ async def main():
     await runner.setup()
     site = web.TCPSite(runner, '0.0.0.0', int(os.environ.get("PORT", 10000)))
     await site.start()
-    logger.info("🚀 OSINT PRO v2.4 запущен! (профессиональный PDF)")
+    logger.info("🚀 OSINT PRO v2.4 запущен!")
     await asyncio.Event().wait()
 
 if __name__ == "__main__":
