@@ -2,6 +2,7 @@ import os
 import asyncio
 import logging
 import re
+import json
 from datetime import datetime, date
 from io import BytesIO
 
@@ -10,7 +11,7 @@ import aiosqlite
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, BufferedInputFile
+from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, BufferedInputFile, Update
 from aiogram.filters import CommandStart
 from aiogram.enums import ParseMode
 from aiohttp import web
@@ -23,7 +24,7 @@ from reportlab.lib import colors
 # ================= CONFIG =================
 TOKEN = os.environ.get("TOKEN")
 ADMIN_CHAT_ID = int(os.environ.get("ADMIN_CHAT_ID", 0))
-WEBHOOK_URL = os.environ.get("WEBHOOK_URL")          # https://твой-проект.onrender.com/webhook
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL")
 GOOGLE_CREDENTIALS = os.environ.get("GOOGLE_CREDENTIALS")
 SHEET_ID = os.environ.get("SHEET_ID")
 DB_NAME = "osint_pro.db"
@@ -35,13 +36,13 @@ logger = logging.getLogger(__name__)
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
-# ================= FONT (кириллица) =================
+# ================= FONT =================
 FONT_NAME = "DejaVuSans"
 try:
     pdfmetrics.registerFont(TTFont(FONT_NAME, "DejaVuSans.ttf"))
-    logger.info("✅ DejaVuSans загружен")
-except Exception as e:
-    logger.warning(f"Шрифт не найден, будет Helvetica: {e}")
+    logger.info("✅ Шрифт DejaVuSans загружен")
+except Exception:
+    logger.warning("Шрифт DejaVuSans не найден → будет Helvetica")
     FONT_NAME = "Helvetica"
 
 # ================= DATABASE =================
@@ -74,11 +75,10 @@ async def log_usage(user_id: int):
 gc = None
 if GOOGLE_CREDENTIALS and SHEET_ID:
     try:
-        creds = ServiceAccountCredentials.from_json_keyfile_dict(
-            json.loads(GOOGLE_CREDENTIALS),
-            ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
-        )
-        gc = gspread.authorize(creds)
+        creds_dict = json.loads(GOOGLE_CREDENTIALS)
+        scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
+        credentials = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
+        gc = gspread.authorize(credentials)
         logger.info("✅ Google Sheets подключён")
     except Exception as e:
         logger.error(f"Google Sheets error: {e}")
@@ -134,7 +134,6 @@ def create_pro_pdf(data: dict, score: int, risks: list, color: colors):
     c = canvas.Canvas(buffer, pagesize=A4)
     w, h = A4
 
-    # Header
     c.setFillColor(colors.HexColor("#f4f4f4"))
     c.rect(0, h - 100, w, 100, fill=1, stroke=0)
     c.setFillColor(colors.HexColor("#1a237e"))
@@ -145,7 +144,6 @@ def create_pro_pdf(data: dict, score: int, risks: list, color: colors):
     c.setFillColor(colors.grey)
     c.drawString(50, h - 80, f"Сформировано: {datetime.now().strftime('%d.%m.%Y %H:%M')}")
 
-    # Индекс безопасности
     c.setFont(FONT_NAME, 14)
     c.setFillColor(colors.black)
     c.drawString(50, h - 140, "ИНДЕКС БЕЗОПАСНОСТИ:")
@@ -157,7 +155,6 @@ def create_pro_pdf(data: dict, score: int, risks: list, color: colors):
     c.setFont(FONT_NAME, 16)
     c.drawString(270, h - 165, f"{score} / 100")
 
-    # Основные данные
     y = h - 220
     info = [
         ("Организация:", data.get('name') or data.get('short_name') or "Н/Д"),
@@ -174,7 +171,6 @@ def create_pro_pdf(data: dict, score: int, risks: list, color: colors):
         c.drawString(180, y, str(val))
         y -= 28
 
-    # Заключение
     y -= 20
     c.setStrokeColor(colors.lightgrey)
     c.line(50, y, 550, y)
@@ -197,7 +193,7 @@ def create_pro_pdf(data: dict, score: int, risks: list, color: colors):
 async def cmd_start(message: Message):
     await message.answer(
         "🚀 **OSINT PRO v2.0**\n\n"
-        "Пришлите ИНН или ОГРН для глубокого анализа.\n"
+        "Пришлите ИНН или ОГРН для анализа.\n"
         "Бесплатно — 3 запроса в сутки.",
         parse_mode=ParseMode.MARKDOWN
     )
@@ -209,13 +205,10 @@ async def handle_search(message: Message):
         return
 
     if not await check_limit(message.from_user.id):
-        return await message.answer(
-            "🛑 Лимит 3 запроса в день исчерпан.\n"
-            "Купите подписку для безлимитного доступа.",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-                InlineKeyboardButton(text="💰 Купить подписку", callback_data="buy")
-            ]])
-        )
+        kb = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="💰 Купить подписку", callback_data="buy")
+        ]])
+        return await message.answer("🛑 Лимит 3 запроса в день исчерпан.", reply_markup=kb)
 
     wait = await message.answer("🔍 Идёт анализ по реестрам ФНС...")
 
@@ -270,14 +263,14 @@ async def buy_subscription(call: CallbackQuery):
         "Напишите @ваш_логин для оплаты"
     )
 
-# ================= WEB SERVER =================
+# ================= WEBHOOK & HEALTH =================
 async def health_handler(request):
     return web.Response(text="OK", status=200)
 
 async def webhook_handler(request):
     try:
         data = await request.json()
-        update = types.Update.model_validate(data)
+        update = Update.model_validate(data)
         await bot.process_new_updates([update])
         return web.Response()
     except Exception as e:
@@ -287,13 +280,10 @@ async def webhook_handler(request):
 async def main():
     await init_db()
 
-    # Удаляем старый webhook и ставим новый
     await bot.delete_webhook(drop_pending_updates=True)
     await bot.set_webhook(url=WEBHOOK_URL)
-
     logger.info(f"✅ Webhook установлен: {WEBHOOK_URL}")
 
-    # Запускаем aiohttp сервер
     app = web.Application()
     app.router.add_get("/", health_handler)
     app.router.add_post("/webhook", webhook_handler)
@@ -302,8 +292,8 @@ async def main():
     await runner.setup()
     await web.TCPSite(runner, '0.0.0.0', int(os.environ.get("PORT", 10000))).start()
 
-    logger.info("🚀 OSINT PRO v2.0 запущен на Render")
-    await asyncio.Event().wait()  # держим процесс живым
+    logger.info("🚀 OSINT PRO v2.0 запущен успешно!")
+    await asyncio.Event().wait()
 
 if __name__ == "__main__":
     asyncio.run(main())
