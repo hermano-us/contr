@@ -8,6 +8,7 @@ from io import BytesIO
 import aiohttp
 import aiosqlite
 import gspread
+import pandas as pd
 from oauth2client.service_account import ServiceAccountCredentials
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, BufferedInputFile, Update
@@ -20,7 +21,6 @@ from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.lib import colors
 from reportlab.platypus import Table, TableStyle
-
 # ================= CONFIG =================
 TOKEN = os.environ.get("TOKEN")
 ADMIN_CHAT_ID = int(os.environ.get("ADMIN_CHAT_ID", 0))
@@ -31,18 +31,14 @@ CHECKO_API_KEY = os.environ.get("CHECKO_API_KEY")
 DB_NAME = "osint_pro.db"
 FREE_LIMIT = 3
 SUBSCRIPTION_PRICE = "4900 ₽/мес"
-
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
-
 if CHECKO_API_KEY:
     logger.info("✅ Checko API подключён — полный профиль + поиск + арбитраж")
 else:
     logger.warning("⚠️ CHECKO_API_KEY не задан — используется только ЕГРЮЛ")
-
 # ================= FONT =================
 FONT_NAME = "DejaVuSans"
 FONT_PATH = "DejaVuSans.ttf"
@@ -52,7 +48,6 @@ if os.path.exists(FONT_PATH):
 else:
     logger.error("❌ DejaVuSans.ttf не найден!")
     FONT_NAME = "Helvetica"
-
 # ================= DATABASE =================
 async def init_db():
     async with aiosqlite.connect(DB_NAME) as db:
@@ -68,13 +63,18 @@ async def init_db():
             pass
         await db.execute('''CREATE TABLE IF NOT EXISTS subscriptions
                             (user_id INTEGER PRIMARY KEY, until_date DATE)''')
-        await db.execute('''CREATE TABLE IF NOT EXISTS cache (
-                            inn TEXT PRIMARY KEY,
-                            data TEXT,
-                            arbitration_data TEXT,
-                            cached_at TEXT)''')
+        # ================= НОВАЯ ТАБЛИЦА ДЛЯ МОНИТОРИНГА (ЭТАП 2) =================
+        await db.execute('''CREATE TABLE IF NOT EXISTS monitored (
+                            user_id INTEGER,
+                            inn TEXT,
+                            last_checked TEXT,
+                            last_full_name TEXT,
+                            last_status TEXT,
+                            last_score INTEGER DEFAULT 0,
+                            last_arb_count INTEGER DEFAULT 0,
+                            last_director TEXT,
+                            PRIMARY KEY (user_id, inn))''')
         await db.commit()
-
 async def is_subscribed(user_id: int) -> bool:
     async with aiosqlite.connect(DB_NAME) as db:
         async with db.execute("SELECT until_date FROM subscriptions WHERE user_id = ?", (user_id,)) as cursor:
@@ -82,7 +82,6 @@ async def is_subscribed(user_id: int) -> bool:
             if not row or not row[0]:
                 return False
             return datetime.strptime(row[0], '%Y-%m-%d').date() >= date.today()
-
 async def check_limit(user_id: int) -> tuple[bool, int, bool]:
     subscribed = await is_subscribed(user_id)
     if subscribed:
@@ -98,7 +97,6 @@ async def check_limit(user_id: int) -> tuple[bool, int, bool]:
     except Exception as e:
         logger.error(f"DB Error: {e}")
         return True, FREE_LIMIT, False
-
 async def log_usage(user_id: int, inn: str, score: int, is_premium: bool):
     async with aiosqlite.connect(DB_NAME) as db:
         await db.execute(
@@ -108,19 +106,16 @@ async def log_usage(user_id: int, inn: str, score: int, is_premium: bool):
         await db.commit()
     if is_premium:
         logger.info(f"Платный запрос от {user_id} по ИНН {inn} (score: {score})")
-
 # ================= ADMIN FUNCTIONS =================
 async def grant_subscription(user_id: int, days: int):
     until = (date.today() + timedelta(days=days)).isoformat()
     async with aiosqlite.connect(DB_NAME) as db:
         await db.execute("INSERT OR REPLACE INTO subscriptions (user_id, until_date) VALUES (?, ?)", (user_id, until))
         await db.commit()
-
 async def revoke_subscription(user_id: int):
     async with aiosqlite.connect(DB_NAME) as db:
         await db.execute("DELETE FROM subscriptions WHERE user_id = ?", (user_id,))
         await db.commit()
-
 async def get_stats() -> str:
     try:
         async with aiosqlite.connect(DB_NAME) as db:
@@ -138,7 +133,6 @@ async def get_stats() -> str:
     except Exception as e:
         logger.error(f"Stats error: {e}")
         return "❌ Ошибка получения статистики"
-
 # ================= CACHE =================
 async def get_from_cache(inn: str) -> tuple[dict | None, dict | None, str | None]:
     try:
@@ -158,7 +152,6 @@ async def get_from_cache(inn: str) -> tuple[dict | None, dict | None, str | None
     except Exception as e:
         logger.error(f"Cache read error: {e}")
     return None, None, None
-
 async def save_to_cache(inn: str, data: dict | None, arbitration_data: dict | None):
     if not data:
         return
@@ -175,7 +168,6 @@ async def save_to_cache(inn: str, data: dict | None, arbitration_data: dict | No
             await db.commit()
     except Exception as e:
         logger.error(f"Cache save error: {e}")
-
 async def get_company_data(inn: str, force_refresh: bool = False) -> tuple[dict | None, dict | None, str | None]:
     if not force_refresh:
         cached_data, cached_arb, cached_at = await get_from_cache(inn)
@@ -190,7 +182,142 @@ async def get_company_data(inn: str, force_refresh: bool = False) -> tuple[dict 
     else:
         cached_at = None
     return data, arbitration_data, cached_at
+# ================= MONITORING SYSTEM (ЭТАП 2) =================
+async def is_monitored(user_id: int, inn: str) -> bool:
+    try:
+        async with aiosqlite.connect(DB_NAME) as db:
+            async with db.execute("SELECT 1 FROM monitored WHERE user_id = ? AND inn = ?", (user_id, inn)) as cursor:
+                return await cursor.fetchone() is not None
+    except Exception as e:
+        logger.error(f"Monitor check error: {e}")
+        return False
 
+async def get_user_monitored(user_id: int):
+    try:
+        async with aiosqlite.connect(DB_NAME) as db:
+            async with db.execute(
+                "SELECT inn, last_full_name FROM monitored WHERE user_id = ?",
+                (user_id,)
+            ) as cursor:
+                return await cursor.fetchall()
+    except Exception as e:
+        logger.error(f"Get monitored error: {e}")
+        return []
+
+async def add_to_monitoring(user_id: int, inn: str) -> bool:
+    try:
+        data, arbitration_data, _ = await get_company_data(inn, force_refresh=True)
+        if not data:
+            return False
+        score, _, _, _, _, _, _ = get_risk_assessment(data, arbitration_data)
+        status_text, _ = get_company_status(data)
+        arb_count = 0
+        if arbitration_data and isinstance(arbitration_data, dict):
+            arb_count = arbitration_data.get("total", 0) or len(arbitration_data.get("cases", []))
+        director = safe_get_director(data)
+        full_name = data.get('НаимПолн') or data.get('full_name') or "Н/Д"
+        async with aiosqlite.connect(DB_NAME) as db:
+            await db.execute(
+                """INSERT OR REPLACE INTO monitored 
+                   (user_id, inn, last_checked, last_full_name, last_status, last_score, last_arb_count, last_director)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (user_id, inn, datetime.now().isoformat(), full_name, status_text, score, arb_count, director)
+            )
+            await db.commit()
+        logger.info(f"✅ Компания {inn} добавлена в мониторинг для пользователя {user_id}")
+        return True
+    except Exception as e:
+        logger.error(f"Add to monitoring error: {e}")
+        return False
+
+async def remove_from_monitoring(user_id: int, inn: str):
+    try:
+        async with aiosqlite.connect(DB_NAME) as db:
+            await db.execute("DELETE FROM monitored WHERE user_id = ? AND inn = ?", (user_id, inn))
+            await db.commit()
+        logger.info(f"✅ Компания {inn} удалена из мониторинга для пользователя {user_id}")
+    except Exception as e:
+        logger.error(f"Remove from monitoring error: {e}")
+
+async def check_monitored_companies():
+    """Фоновая проверка всех компаний в мониторинге (каждые 4 часа)"""
+    try:
+        async with aiosqlite.connect(DB_NAME) as db:
+            async with db.execute("SELECT user_id, inn FROM monitored") as cursor:
+                all_monitored = await cursor.fetchall()
+    except Exception as e:
+        logger.error(f"Monitoring DB error: {e}")
+        return
+
+    logger.info(f"🔄 Проверка {len(all_monitored)} компаний в мониторинге...")
+
+    for user_id, inn in all_monitored:
+        try:
+            data, arbitration_data, _ = await get_company_data(inn, force_refresh=True)
+            if not data:
+                continue
+
+            score, _, _, _, _, _, _ = get_risk_assessment(data, arbitration_data)
+            status_text, _ = get_company_status(data)
+            arb_count = 0
+            if arbitration_data and isinstance(arbitration_data, dict):
+                arb_count = arbitration_data.get("total", 0) or len(arbitration_data.get("cases", []))
+            director = safe_get_director(data)
+            full_name = data.get('НаимПолн') or data.get('full_name') or "Н/Д"
+
+            # Получаем предыдущее состояние
+            async with aiosqlite.connect(DB_NAME) as db:
+                async with db.execute(
+                    """SELECT last_status, last_arb_count, last_director 
+                       FROM monitored WHERE user_id = ? AND inn = ?""",
+                    (user_id, inn)
+                ) as cursor:
+                    last = await cursor.fetchone()
+
+            changes = []
+            if last:
+                last_status, last_arb, last_dir = last
+                if status_text != last_status:
+                    changes.append(f"📌 Статус изменился → {status_text}")
+                if arb_count > last_arb:
+                    changes.append(f"⚖️ Новые арбитражные дела (+{arb_count - last_arb})")
+                if director != last_dir and director != "Н/Д":
+                    changes.append(f"👤 Сменился руководитель → {director}")
+
+            # Обновляем состояние в БД
+            async with aiosqlite.connect(DB_NAME) as db:
+                await db.execute(
+                    """INSERT OR REPLACE INTO monitored 
+                       (user_id, inn, last_checked, last_full_name, last_status, last_score, last_arb_count, last_director)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (user_id, inn, datetime.now().isoformat(), full_name, status_text, score, arb_count, director)
+                )
+                await db.commit()
+
+            if changes:
+                kb = InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="📥 Открыть отчёт", callback_data=f"pdf_{inn}")],
+                    [InlineKeyboardButton(text="🔄 Обновить сейчас", callback_data=f"refresh_{inn}")]
+                ])
+                await bot.send_message(
+                    user_id,
+                    f"🔔 **OSINT PRO • Обновление мониторинга**\n\n"
+                    f"🏢 {full_name}\n"
+                    f"📋 ИНН `{inn}`\n\n"
+                    f"⚠️ **Обнаружены изменения:**\n" + "\n".join(changes),
+                    parse_mode=ParseMode.MARKDOWN,
+                    reply_markup=kb
+                )
+                logger.info(f"📨 Уведомление отправлено пользователю {user_id} по {inn}")
+        except Exception as e:
+            logger.error(f"Monitoring check error for {inn} (user {user_id}): {e}")
+            continue
+
+async def monitoring_scheduler():
+    """Фоновая задача — проверка мониторинга каждые 4 часа"""
+    while True:
+        await check_monitored_companies()
+        await asyncio.sleep(14400)  # 4 часа
 # ================= API =================
 async def get_checko_company(inn: str) -> dict | None:
     if not CHECKO_API_KEY:
@@ -207,7 +334,6 @@ async def get_checko_company(inn: str) -> dict | None:
     except Exception as e:
         logger.error(f"Checko error: {e}")
         return None
-
 async def get_egrul_data(inn: str) -> dict | None:
     try:
         async with aiohttp.ClientSession() as session:
@@ -217,7 +343,6 @@ async def get_egrul_data(inn: str) -> dict | None:
     except:
         pass
     return None
-
 async def get_arbitration_data(inn: str) -> dict | None:
     if not CHECKO_API_KEY:
         return None
@@ -232,7 +357,6 @@ async def get_arbitration_data(inn: str) -> dict | None:
     except Exception as e:
         logger.error(f"Arbitration error: {e}")
         return None
-
 async def search_by_name(query: str) -> list[dict] | None:
     if not CHECKO_API_KEY:
         return None
@@ -248,13 +372,11 @@ async def search_by_name(query: str) -> list[dict] | None:
     except Exception as e:
         logger.error(f"Search by name error: {e}")
         return None
-
 # ================= HELPERS =================
 def get_formatted_address(data: dict) -> str:
     if isinstance(data.get("ЮрАдрес"), dict):
         return data["ЮрАдрес"].get("АдресРФ") or data.get("address", "Н/Д")
     return data.get("address", "Н/Д")
-
 def calculate_age(reg_date_str: str) -> str:
     if not reg_date_str:
         return "Н/Д"
@@ -266,7 +388,6 @@ def calculate_age(reg_date_str: str) -> str:
         return f"{reg_date.strftime('%d.%m.%Y')} ({years} лет {months} мес.)"
     except:
         return reg_date_str
-
 def get_company_status(data: dict) -> tuple[str, str]:
     status = str(data.get('Статус', {}).get('Наим') or data.get('status_text') or data.get('status') or "Действует").lower()
     if any(word in status for word in ["ликвидац", "прекращ", "ликвидирован"]):
@@ -276,7 +397,6 @@ def get_company_status(data: dict) -> tuple[str, str]:
     if any(word in status for word in ["недейств", "исключен"]):
         return "Недействующий статус", "⚠️"
     return "Действует", "✅"
-
 def get_risk_assessment(data: dict, arbitration_data: dict | None = None):
     score = 100
     risk_factors = []
@@ -313,14 +433,12 @@ def get_risk_assessment(data: dict, arbitration_data: dict | None = None):
     color = colors.green if score > 75 else colors.orange if score > 45 else colors.red
     recommendation = "✅ Рекомендуется к работе" if score > 80 else "🟡 Требует дополнительной проверки" if score >= 60 else "🚫 Высокий риск!"
     return score, risk_factors, warnings, color, recommendation, arbitration_data, mass_flags
-
 def is_individual_entrepreneur(data: dict) -> bool:
     if not data:
         return False
     name = (data.get("НаимПолн") or data.get("full_name") or "").lower()
     ogrn = data.get("ОГРН") or data.get("ОГРНИП") or ""
     return "индивидуальный предприниматель" in name or name.startswith("ип ") or len(str(ogrn)) == 15
-
 def safe_get_director(data: dict) -> str:
     ruk = data.get("Руковод")
     if isinstance(ruk, list) and ruk:
@@ -328,19 +446,16 @@ def safe_get_director(data: dict) -> str:
     if isinstance(ruk, dict):
         return ruk.get("ФИО") or ruk.get("Наим") or "Н/Д"
     return "Н/Д"
-
 def safe_get_branches(data: dict) -> int:
     fil = data.get("Филиалы")
     if isinstance(fil, list):
         return len(fil)
     return 0
-
 def safe_get_founders_count(data: dict) -> int:
     uch = data.get("Учред", {}) or {}
     fl = len(uch.get("ФЛ", [])) if isinstance(uch.get("ФЛ"), list) else 0
     org = len(uch.get("РосОрг", [])) if isinstance(uch.get("РосОрг"), list) else 0
     return fl + org
-
 def safe_get_okved(data: dict) -> str:
     okved = data.get("ОКВЭД") or data.get("okved") or {}
     if isinstance(okved, dict):
@@ -348,7 +463,6 @@ def safe_get_okved(data: dict) -> str:
         name = okved.get("Наим") or okved.get("name") or ""
         return f"{code} — {name}"
     return str(okved) or "Н/Д"
-
 def get_arbitration_cases_table(arbitration_data: dict | None) -> list:
     """Возвращает данные для таблицы арбитражных дел (максимум 6 записей)"""
     if not arbitration_data or not isinstance(arbitration_data, dict):
@@ -365,7 +479,6 @@ def get_arbitration_cases_table(arbitration_data: dict | None) -> list:
         status = case.get("Статус") or case.get("status") or "—"
         table.append([date_str, amount, plaintiff, defendant, status])
     return table
-
 # ================= PDF v2.8 (ТАБЛИЦЫ + АРБИТРАЖ) =================
 def draw_multiline(c, x, y, text, font_size=10, max_width=480, line_height=14):
     if not text:
@@ -383,7 +496,6 @@ def draw_multiline(c, x, y, text, font_size=10, max_width=480, line_height=14):
         c.drawString(x, y, line)
         y -= line_height
     return y
-
 def create_pro_pdf(data: dict, score: int, risks: list, warnings: list, color: colors,
                    recommendation: str, arbitration_data: dict | None, mass_flags: list,
                    is_premium: bool, cache_time: str | None = None):
@@ -535,7 +647,7 @@ def create_pro_pdf(data: dict, score: int, risks: list, warnings: list, color: c
         rt.wrapOn(c, 50, y)
         rt.drawOn(c, 50, y - rt._height)
         y -= rt._height + 20
-    # === ТАБЛИЦА АРБИТРАЖНЫХ ДЕЛ ===
+    # === НОВОЕ: ТАБЛИЦА АРБИТРАЖНЫХ ДЕЛ ===
     arb_table_data = get_arbitration_cases_table(arbitration_data)
     if len(arb_table_data) > 1:
         c.setFont(FONT_NAME, 13)
@@ -579,8 +691,7 @@ def create_pro_pdf(data: dict, score: int, risks: list, warnings: list, color: c
     c.save()
     buffer.seek(0)
     return buffer
-
-# ================= GOOGLE SHEETS + EXCEL (pandas теперь импортируется только при необходимости) =================
+# ================= GOOGLE SHEETS + EXCEL =================
 gc = None
 if GOOGLE_CREDENTIALS and SHEET_ID:
     try:
@@ -591,7 +702,6 @@ if GOOGLE_CREDENTIALS and SHEET_ID:
         logger.info("✅ Google Sheets подключён")
     except Exception as e:
         logger.error(f"Google Sheets error: {e}")
-
 def log_to_sheet(user_id, inn, score: int):
     if not gc or not SHEET_ID:
         return
@@ -602,15 +712,7 @@ def log_to_sheet(user_id, inn, score: int):
         worksheet.append_row([now.strftime("%d.%m.%Y %H:%M:%S"), str(user_id), inn, f"score:{score}", "Бесплатный", now.strftime("%H:%M:%S")])
     except Exception as e:
         logger.error(f"Sheet write error: {e}")
-
 async def export_stats_to_excel() -> BytesIO:
-    """Экспорт статистики в Excel. pandas импортируется здесь, чтобы бот запускался даже без pandas."""
-    try:
-        import pandas as pd  # ← ЛЕНИВАЯ ИМПОРТ — решает ошибку на Render
-    except ImportError:
-        logger.error("❌ pandas не установлен! Добавьте 'pandas' и 'openpyxl' в requirements.txt")
-        raise
-
     async with aiosqlite.connect(DB_NAME) as db:
         async with db.execute("SELECT * FROM usage_log ORDER BY query_date DESC") as cur:
             usage_rows = await cur.fetchall()
@@ -618,23 +720,136 @@ async def export_stats_to_excel() -> BytesIO:
         async with db.execute("SELECT * FROM subscriptions") as cur:
             sub_rows = await cur.fetchall()
         sub_df = pd.DataFrame(sub_rows, columns=["user_id", "until_date"])
-
     buffer = BytesIO()
     with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
         usage_df.to_excel(writer, sheet_name="Запросы", index=False)
         sub_df.to_excel(writer, sheet_name="Подписки", index=False)
     buffer.seek(0)
     return buffer
+# ================= MASS CHECK (ЭТАП 3) =================
+async def handle_mass_check_document(message: Message):
+    document = message.document
+    if not document.file_name.lower().endswith(('.xlsx', '.csv')):
+        return await message.answer("❌ Поддерживаются только файлы **.xlsx** и **.csv**")
 
+    subscribed = await is_subscribed(message.from_user.id)
+    if not subscribed:
+        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="💰 Купить подписку", callback_data="buy")]])
+        return await message.answer(
+            "🛑 **Массовая проверка** доступна только по подписке Pro.\n\n"
+            "Безлимит + Excel-отчёт по сотням компаний — 4900 ₽/мес",
+            reply_markup=kb
+        )
+
+    wait_msg = await message.answer("📤 **Обрабатываю файл...**\nЭто может занять 30–120 секунд в зависимости от количества ИНН.")
+
+    # Скачиваем файл
+    file = await bot.get_file(document.file_id)
+    file_bytes = BytesIO()
+    await bot.download_file(file.file_path, file_bytes)
+    file_bytes.seek(0)
+
+    try:
+        if document.file_name.lower().endswith('.csv'):
+            df = pd.read_csv(file_bytes)
+        else:
+            df = pd.read_excel(file_bytes)
+    except Exception:
+        await wait_msg.edit_text("❌ Не удалось прочитать файл. Убедитесь, что формат корректный.")
+        return
+
+    # Поиск колонки с ИНН
+    inn_col = None
+    for col in df.columns:
+        col_str = str(col).lower()
+        if any(x in col_str for x in ['инн', 'inn', 'tax', 'id']):
+            inn_col = col
+            break
+
+    if inn_col is None:
+        # Если не нашли — берём первую колонку
+        df['inn'] = df.iloc[:, 0].astype(str).str.strip()
+    else:
+        df['inn'] = df[inn_col].astype(str).str.strip()
+
+    # Очищаем и валидируем ИНН
+    inns = []
+    for val in df['inn']:
+        clean = re.sub(r'\D', '', str(val))
+        if len(clean) in (10, 12):
+            inns.append(clean)
+    inns = list(dict.fromkeys(inns))[:100]  # максимум 100, убираем дубли
+
+    if not inns:
+        await wait_msg.edit_text("❌ В файле не найдено валидных ИНН (10 или 12 цифр).")
+        return
+
+    results = []
+    for idx, inn in enumerate(inns, 1):
+        data, arbitration_data, _ = await get_company_data(inn)
+        if not data:
+            results.append({
+                "ИНН": inn,
+                "Название": "Не найдено",
+                "Статус": "—",
+                "Индекс безопасности": 0,
+                "Рекомендация": "Данные отсутствуют",
+                "Арбитражных дел": 0,
+                "Руководитель": "—",
+                "Дата регистрации": "—"
+            })
+            continue
+
+        score, _, _, _, recommendation, _, _ = get_risk_assessment(data, arbitration_data)
+        name = data.get('НаимСокр') or data.get('full_name') or data.get('НаимПолн') or "—"
+        status = get_company_status(data)[0]
+        arb_count = len(arbitration_data.get("cases", [])) if arbitration_data and isinstance(arbitration_data, dict) else 0
+
+        results.append({
+            "ИНН": inn,
+            "Название": name,
+            "Статус": status,
+            "Индекс безопасности": score,
+            "Рекомендация": recommendation,
+            "Арбитражных дел": arb_count,
+            "Руководитель": safe_get_director(data),
+            "Дата регистрации": calculate_age(data.get('ДатаРег', ''))
+        })
+
+    # Создаём Excel-отчёт
+    result_df = pd.DataFrame(results)
+    excel_buffer = BytesIO()
+    with pd.ExcelWriter(excel_buffer, engine='openpyxl') as writer:
+        result_df.to_excel(writer, sheet_name="OSINT PRO — Массовый отчёт", index=False)
+    excel_buffer.seek(0)
+
+    # Статистика
+    total = len(results)
+    risky = len([r for r in results if r["Индекс безопасности"] < 60])
+    summary = (f"✅ **Массовый отчёт OSINT PRO готов!**\n\n"
+               f"📊 Проверено компаний: **{total}**\n"
+               f"🔴 Высокий риск: **{risky}**\n"
+               f"✅ Нормальный/низкий риск: **{total - risky}**")
+
+    await wait_msg.delete()
+    await message.answer_document(
+        BufferedInputFile(excel_buffer.read(), filename=f"OSINT_PRO_mass_check_{datetime.now().strftime('%Y-%m-%d_%H-%M')}.xlsx"),
+        caption=summary
+    )
 # ================= HANDLERS =================
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
     is_admin = message.from_user.id == ADMIN_CHAT_ID
-    text = "🚀 **OSINT PRO v2.8**\n\nПоиск **по ИНН** и **по названию**!\n✅ Таблицы в PDF • Арбитражные дела • ОКВЭД\n\nПришлите ИНН / ОГРН или название компании"
+    text = ("🚀 **OSINT PRO v2.8**\n\n"
+            "Поиск **по ИНН** и **по названию**!\n"
+            "✅ Таблицы в PDF • Арбитражные дела • ОКВЭД\n\n"
+            "📌 **Новые возможности:**\n"
+            "• Мониторинг изменений компаний (уведомления)\n"
+            "• Массовая проверка по Excel/CSV (до 100 ИНН)\n\n"
+            "Пришлите ИНН / ОГРН или название компании")
     if is_admin:
         text += "\n\n👑 **Админ-панель:** /admin"
     await message.answer(text, parse_mode=ParseMode.MARKDOWN)
-
 @dp.message(Command("admin"))
 async def cmd_admin(message: Message):
     if message.from_user.id != ADMIN_CHAT_ID:
@@ -647,14 +862,12 @@ async def cmd_admin(message: Message):
         [InlineKeyboardButton(text="🚫 Отозвать подписку", callback_data="admin_revoke")],
     ])
     await message.answer("👑 **Админ-панель OSINT PRO**", reply_markup=kb)
-
 @dp.callback_query(F.data == "admin_stats")
 async def admin_stats(call: CallbackQuery):
     if call.from_user.id != ADMIN_CHAT_ID: return await call.answer("⛔️ Доступ запрещён.")
     await call.answer()
     stats_text = await get_stats()
     await call.message.edit_text(stats_text, parse_mode=ParseMode.MARKDOWN)
-
 @dp.callback_query(F.data == "admin_export")
 async def admin_export(call: CallbackQuery):
     if call.from_user.id != ADMIN_CHAT_ID: return await call.answer("⛔️ Доступ запрещён.")
@@ -665,30 +878,24 @@ async def admin_export(call: CallbackQuery):
             BufferedInputFile(excel_buffer.read(), filename=f"OSINT_PRO_статистика_{datetime.now().strftime('%Y-%m-%d')}.xlsx"),
             caption="✅ Полная статистика запросов и подписок"
         )
-    except ImportError:
-        await call.message.answer("❌ pandas не установлен. Добавьте `pandas` и `openpyxl` в requirements.txt и пересоберите проект.")
     except Exception as e:
         logger.error(f"Export error: {e}")
         await call.message.answer("❌ Ошибка генерации Excel")
-
 @dp.callback_query(F.data == "admin_pricing")
 async def admin_pricing(call: CallbackQuery):
     if call.from_user.id != ADMIN_CHAT_ID: return await call.answer("⛔️ Доступ запрещён.")
     await call.answer()
     await call.message.edit_text(f"💰 **Текущая цена подписки**\n\n{SUBSCRIPTION_PRICE}\n\nБезлимит + премиум-PDF")
-
 @dp.callback_query(F.data == "admin_grant")
 async def admin_grant_start(call: CallbackQuery):
     if call.from_user.id != ADMIN_CHAT_ID: return await call.answer("⛔️ Доступ запрещён.")
     await call.answer()
     await call.message.edit_text("🔑 Отправь мне сообщение в формате:\n/grant <user_id> <дней>")
-
 @dp.callback_query(F.data == "admin_revoke")
 async def admin_revoke_start(call: CallbackQuery):
     if call.from_user.id != ADMIN_CHAT_ID: return await call.answer("⛔️ Доступ запрещён.")
     await call.answer()
     await call.message.edit_text("🚫 Отправь мне сообщение в формате:\n/revoke <user_id>")
-
 @dp.message(F.text & ~F.text.startswith("/"))
 async def handle_search(message: Message):
     text = message.text.strip()
@@ -705,6 +912,12 @@ async def handle_search(message: Message):
         score, risks, warnings, color, recommendation, arbitration_data, mass_flags = get_risk_assessment(data, arbitration_data)
         await log_usage(message.from_user.id, inn, score, is_premium)
         log_to_sheet(message.from_user.id, inn, score)
+
+        # === МОНИТОРИНГ: проверяем, уже ли в списке ===
+        is_mon = await is_monitored(message.from_user.id, inn)
+        monitor_text = "❌ Убрать из мониторинга" if is_mon else "📌 Добавить в мониторинг"
+        monitor_cb = f"monitor_remove_{inn}" if is_mon else f"monitor_add_{inn}"
+
         is_ip_flag = is_individual_entrepreneur(data)
         company_name = data.get('НаимСокр') or data.get('short_name') or data.get('full_name') or '—'
         director = safe_get_director(data)
@@ -725,9 +938,11 @@ async def handle_search(message: Message):
         if not is_premium:
             res += f"Осталось бесплатных запросов: **{remaining}/3**\n\n"
         res += "📄 **Полный профессиональный отчёт в PDF**"
+
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="📥 Скачать PDF", callback_data=f"pdf_{inn}")],
-            [InlineKeyboardButton(text="🔄 Обновить данные", callback_data=f"refresh_{inn}")]
+            [InlineKeyboardButton(text="🔄 Обновить данные", callback_data=f"refresh_{inn}")],
+            [InlineKeyboardButton(text=monitor_text, callback_data=monitor_cb)]
         ])
         await wait.delete()
         await message.answer(res, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
@@ -748,9 +963,6 @@ async def handle_search(message: Message):
                 callback_data=f"select_{inn_found}"
             )])
     await wait.edit_text(f"✅ Найдено {len(results)} совпадений.\nВыберите компанию:", reply_markup=kb)
-
-# ... (все остальные handlers остаются без изменений: handle_select, send_pdf, handle_refresh, buy_subscription, cmd_history, cmd_grant, cmd_revoke, cmd_stats, cmd_pricing и т.д.)
-
 @dp.callback_query(F.data.startswith("select_"))
 async def handle_select(call: CallbackQuery):
     inn = call.data.split("_", 1)[1]
@@ -772,7 +984,6 @@ async def handle_select(call: CallbackQuery):
     except Exception as e:
         logger.error(f"Select error: {e}")
         await call.message.answer("❌ Ошибка открытия отчёта.")
-
 @dp.callback_query(F.data.startswith("pdf_"))
 async def send_pdf(call: CallbackQuery):
     inn = call.data.split("_", 1)[1]
@@ -794,7 +1005,6 @@ async def send_pdf(call: CallbackQuery):
     except Exception as e:
         logger.error(f"PDF error INN {inn}", exc_info=True)
         await call.message.answer("❌ Не удалось сгенерировать PDF. Попробуйте позже.")
-
 @dp.callback_query(F.data.startswith("refresh_"))
 async def handle_refresh(call: CallbackQuery):
     inn = call.data.split("_", 1)[1]
@@ -803,12 +1013,29 @@ async def handle_refresh(call: CallbackQuery):
         await db.execute("DELETE FROM cache WHERE inn = ?", (inn,))
         await db.commit()
     await call.message.answer("✅ **Кэш очищен!** Пришлите ИНН / ОГРН ещё раз.")
+# ================= НОВЫЕ CALLBACK'И МОНИТОРИНГА =================
+@dp.callback_query(F.data.startswith("monitor_add_"))
+async def handle_monitor_add(call: CallbackQuery):
+    inn = call.data.split("_", 2)[2]
+    success = await add_to_monitoring(call.from_user.id, inn)
+    if success:
+        await call.answer("✅ Добавлено в мониторинг!\nИзменения будут приходить автоматически.")
+    else:
+        await call.answer("❌ Не удалось добавить в мониторинг")
 
+@dp.callback_query(F.data.startswith("monitor_remove_"))
+async def handle_monitor_remove(call: CallbackQuery):
+    inn = call.data.split("_", 2)[2]
+    await remove_from_monitoring(call.from_user.id, inn)
+    await call.answer("✅ Убрано из мониторинга")
+# ================= MASS CHECK DOCUMENT HANDLER =================
+@dp.message(F.document)
+async def handle_document(message: Message):
+    await handle_mass_check_document(message)
 @dp.callback_query(F.data == "buy")
 async def buy_subscription(call: CallbackQuery):
     await call.answer()
     await call.message.answer(f"💰 **Подписка OSINT PRO**\n\nБезлимит + премиум-отчёты — {SUBSCRIPTION_PRICE}\n\nПосле оплаты напишите @ваш_логин с чеком.")
-
 @dp.message(Command("history"))
 async def cmd_history(message: Message):
     try:
@@ -829,7 +1056,15 @@ async def cmd_history(message: Message):
     except Exception as e:
         logger.error(f"History error: {e}")
         await message.answer("❌ Не удалось загрузить историю.")
-
+@dp.message(Command("monitor"))
+async def cmd_monitor(message: Message):
+    monitored = await get_user_monitored(message.from_user.id)
+    if not monitored:
+        return await message.answer("📭 У вас пока нет компаний в мониторинге.\n\nДобавляйте их из отчёта кнопкой «📌 Добавить в мониторинг»")
+    text = "📌 **Ваши компании в мониторинге** (уведомления каждые 4 часа):\n\n"
+    for inn, name in monitored:
+        text += f"• `{inn}` — {name[:60]}...\n"
+    await message.answer(text, parse_mode=ParseMode.MARKDOWN)
 @dp.message(Command("grant"))
 async def cmd_grant(message: Message):
     if message.from_user.id != ADMIN_CHAT_ID: return await message.answer("⛔️ Доступ запрещён.")
@@ -839,7 +1074,6 @@ async def cmd_grant(message: Message):
         await message.answer(f"✅ Подписка выдана пользователю {user_id_str} на {days_str} дней")
     except:
         await message.answer("❌ Формат: /grant <user_id> <дней>")
-
 @dp.message(Command("revoke"))
 async def cmd_revoke(message: Message):
     if message.from_user.id != ADMIN_CHAT_ID: return await message.answer("⛔️ Доступ запрещён.")
@@ -849,22 +1083,18 @@ async def cmd_revoke(message: Message):
         await message.answer(f"✅ Подписка отозвана у пользователя {user_id_str}")
     except:
         await message.answer("❌ Формат: /revoke <user_id>")
-
 @dp.message(Command("stats"))
 async def cmd_stats(message: Message):
     if message.from_user.id != ADMIN_CHAT_ID: return await message.answer("⛔️ Доступ запрещён.")
     stats_text = await get_stats()
     await message.answer(stats_text, parse_mode=ParseMode.MARKDOWN)
-
 @dp.message(Command("pricing"))
 async def cmd_pricing(message: Message):
     if message.from_user.id != ADMIN_CHAT_ID: return await message.answer("⛔️ Доступ запрещён.")
     await message.answer(f"💰 **Текущая цена подписки**\n\n{SUBSCRIPTION_PRICE}\n\nБезлимит + премиум-PDF")
-
 # ================= WEBHOOK =================
 async def health_handler(request):
     return web.Response(text="OK", status=200)
-
 async def webhook_handler(request):
     try:
         data = await request.json()
@@ -874,12 +1104,13 @@ async def webhook_handler(request):
     except Exception as e:
         logger.error(f"Webhook error: {e}")
         return web.Response(text="OK", status=200)
-
 async def main():
     await init_db()
+    # Запускаем мониторинг в фоне (ЭТАП 2)
+    asyncio.create_task(monitoring_scheduler())
     await bot.delete_webhook(drop_pending_updates=True)
     await bot.set_webhook(url=WEBHOOK_URL)
-    logger.info("🚀 OSINT PRO v2.8-fix запущен (pandas импортируется лениво — бот не падает на Render)")
+    logger.info("🚀 OSINT PRO v2.8-fix запущен с МОНИТОРИНГОМ компаний + МАССОВОЙ проверкой по Excel!")
     app = web.Application()
     app.router.add_get("/", health_handler)
     app.router.add_post("/webhook", webhook_handler)
@@ -887,8 +1118,7 @@ async def main():
     await runner.setup()
     site = web.TCPSite(runner, '0.0.0.0', int(os.environ.get("PORT", 10000)))
     await site.start()
-    logger.info("✅ Webhook установлен")
+    logger.info("✅ Webhook установлен + мониторинг запущен")
     await asyncio.Event().wait()
-
 if __name__ == "__main__":
     asyncio.run(main())
