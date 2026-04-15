@@ -82,11 +82,9 @@ async def init_db():
             await db.execute("ALTER TABLE usage_log ADD COLUMN score INTEGER DEFAULT 0")
         except Exception:
             pass
-
         # subscriptions
         await db.execute('''CREATE TABLE IF NOT EXISTS subscriptions
                             (user_id INTEGER PRIMARY KEY, until_date DATE)''')
-
         # monitored companies
         await db.execute('''CREATE TABLE IF NOT EXISTS monitored (
                             user_id INTEGER,
@@ -98,28 +96,34 @@ async def init_db():
                             last_arb_count INTEGER DEFAULT 0,
                             last_director TEXT,
                             PRIMARY KEY (user_id, inn))''')
-
         # AI cache (24 часа)
         await db.execute('''CREATE TABLE IF NOT EXISTS ai_cache (
                             inn TEXT PRIMARY KEY,
                             summary TEXT,
                             created_at TEXT)''')
-
         # Главный кэш компаний (1 час)
         await db.execute('''CREATE TABLE IF NOT EXISTS cache (
                             inn TEXT PRIMARY KEY,
                             data TEXT,
                             arbitration_data TEXT,
                             cached_at TEXT)''')
-
+        # НОВОЕ: История изменений компании для графиков и таймлайна в PDF (TOP-3)
+        await db.execute('''CREATE TABLE IF NOT EXISTS company_history (
+                            inn TEXT,
+                            timestamp TEXT,
+                            score INTEGER,
+                            arb_count INTEGER DEFAULT 0,
+                            status TEXT,
+                            director TEXT,
+                            PRIMARY KEY (inn, timestamp))''')
         # Индексы — критично для скорости при 1000+ пользователях
         await db.execute("CREATE INDEX IF NOT EXISTS idx_usage_log_user_date ON usage_log(user_id, query_date)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_monitored_user ON monitored(user_id)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_ai_cache_inn ON ai_cache(inn)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_cache_inn ON cache(inn)")
-
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_history_inn ON company_history(inn)")
         await db.commit()
-    logger.info("✅ База данных инициализирована (все таблицы + индексы)")
+    logger.info("✅ База данных инициализирована (все таблицы + индексы + company_history)")
 
 async def is_subscribed(user_id: int) -> bool:
     async with aiosqlite.connect(DB_NAME) as db:
@@ -241,6 +245,47 @@ async def get_company_data(inn: str, force_refresh: bool = False) -> tuple[dict 
         cached_at = None
     return data, arbitration_data, cached_at
 
+# ================= HISTORY FOR PDF GRAPHS (TOP-3) =================
+async def save_to_history(inn: str, score: int, arb_count: int, status: str, director: str):
+    """Сохраняет точку истории только если прошло ≥30 минут с последнего сохранения (чтобы не раздувать БД)"""
+    try:
+        async with aiosqlite.connect(DB_NAME) as db:
+            # Проверяем время последней записи
+            async with db.execute(
+                "SELECT timestamp FROM company_history WHERE inn = ? ORDER BY timestamp DESC LIMIT 1",
+                (inn,)
+            ) as cursor:
+                row = await cursor.fetchone()
+                if row:
+                    last_ts = datetime.fromisoformat(row[0].replace("Z", "+00:00"))
+                    if (datetime.now() - last_ts).total_seconds() < 1800:  # 30 минут
+                        return
+            await db.execute(
+                """INSERT INTO company_history 
+                   (inn, timestamp, score, arb_count, status, director)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (inn, datetime.now().isoformat(), score, arb_count, status, director)
+            )
+            await db.commit()
+    except Exception as e:
+        logger.error(f"History save error for {inn}: {e}")
+
+async def get_company_history(inn: str, limit: int = 12) -> list:
+    """Возвращает историю по ИНН (новейшие сверху) для графиков и таймлайна в PDF"""
+    try:
+        async with aiosqlite.connect(DB_NAME) as db:
+            async with db.execute(
+                """SELECT timestamp, score, arb_count, status, director 
+                   FROM company_history 
+                   WHERE inn = ? 
+                   ORDER BY timestamp DESC LIMIT ?""",
+                (inn, limit)
+            ) as cursor:
+                return await cursor.fetchall()
+    except Exception as e:
+        logger.error(f"History read error: {e}")
+        return []
+
 # ================= MONITORING SYSTEM =================
 async def is_monitored(user_id: int, inn: str) -> bool:
     try:
@@ -275,6 +320,8 @@ async def add_to_monitoring(user_id: int, inn: str) -> bool:
             arb_count = arbitration_data.get("total", 0) or len(arbitration_data.get("cases", []))
         director = safe_get_director(data)
         full_name = data.get('НаимПолн') or data.get('full_name') or "Н/Д"
+        # НОВОЕ: сохраняем историю для графиков
+        await save_to_history(inn, score, arb_count, status_text, director)
         async with aiosqlite.connect(DB_NAME) as db:
             await db.execute(
                 """INSERT OR REPLACE INTO monitored
@@ -306,16 +353,13 @@ async def check_monitored_companies():
     except Exception as e:
         logger.error(f"Monitoring DB error: {e}")
         return
-
     logger.info(f"🔄 Запущена проверка мониторинга: {len(all_monitored)} компаний...")
     changes_count = 0
-
     for user_id, inn in all_monitored:
         try:
             data, arbitration_data, _ = await get_company_data(inn, force_refresh=True)
             if not data:
                 continue
-
             score, _, _, _, _, _, _ = get_risk_assessment(data, arbitration_data)
             status_text, _ = get_company_status(data)
             arb_count = 0
@@ -323,7 +367,8 @@ async def check_monitored_companies():
                 arb_count = arbitration_data.get("total", 0) or len(arbitration_data.get("cases", []))
             director = safe_get_director(data)
             full_name = data.get('НаимПолн') or data.get('full_name') or "Н/Д"
-
+            # НОВОЕ: сохраняем историю для графиков
+            await save_to_history(inn, score, arb_count, status_text, director)
             async with aiosqlite.connect(DB_NAME) as db:
                 async with db.execute(
                     """SELECT last_status, last_arb_count, last_director
@@ -331,7 +376,6 @@ async def check_monitored_companies():
                     (user_id, inn)
                 ) as cursor:
                     last = await cursor.fetchone()
-
             changes = []
             if last:
                 last_status, last_arb, last_dir = last
@@ -341,7 +385,6 @@ async def check_monitored_companies():
                     changes.append(f"⚖️ +{arb_count - last_arb} арбитражных дел")
                 if director != last_dir and director != "Н/Д":
                     changes.append(f"👤 Новый руководитель → {director}")
-
             # Обновляем данные
             async with aiosqlite.connect(DB_NAME) as db:
                 await db.execute(
@@ -351,7 +394,6 @@ async def check_monitored_companies():
                     (user_id, inn, datetime.now().isoformat(), full_name, status_text, score, arb_count, director)
                 )
                 await db.commit()
-
             if changes:
                 changes_count += 1
                 kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -370,7 +412,6 @@ async def check_monitored_companies():
         except Exception as e:
             logger.error(f"Monitoring error for {inn} (user {user_id}): {e}")
             continue
-
     duration = (datetime.now() - start).total_seconds()
     logger.info(f"✅ Мониторинг завершён за {duration:.1f} сек. Изменений: {changes_count}")
 
@@ -393,12 +434,10 @@ async def get_ai_summary(data: dict, score: int, risks: list, recommendation: st
             row = await cursor.fetchone()
             if row and row[0]:
                 return row[0]
-
     company_name = data.get('НаимПолн') or data.get('full_name') or data.get('НаимСокр') or "Компания"
     arb_count = 0
     if arbitration_data and isinstance(arbitration_data, dict):
         arb_count = arbitration_data.get("total", 0) or len(arbitration_data.get("cases", []))
-
     prompt = f"""Ты — эксперт по проверке контрагентов в России (OSINT PRO v{VERSION}).
 Дай короткое (2–4 предложения), честное и полезное резюме на русском.
 Название: {company_name}
@@ -409,7 +448,6 @@ async def get_ai_summary(data: dict, score: int, risks: list, recommendation: st
 Арбитраж: {arb_count} дел
 Стиль: профессиональный, лаконичный, с эмодзи. Начинай строго с:
 ✅ Вывод OSINT PRO AI:"""
-
     try:
         async with aiohttp.ClientSession() as session:
             if AI_PROVIDER == "gemini":
@@ -420,7 +458,6 @@ async def get_ai_summary(data: dict, score: int, risks: list, recommendation: st
                 url = "https://api.openai.com/v1/chat/completions" if AI_PROVIDER == "openai" else "https://api.x.ai/v1/chat/completions"
                 payload = {"model": AI_MODEL, "messages": [{"role": "user", "content": prompt}], "temperature": 0.65, "max_tokens": 300}
                 headers = {"Content-Type": "application/json", "Authorization": f"Bearer {AI_API_KEY}"}
-
             async with session.post(url, json=payload, headers=headers, timeout=15) as resp:
                 if resp.status != 200:
                     error_text = await resp.text()
@@ -431,7 +468,6 @@ async def get_ai_summary(data: dict, score: int, risks: list, recommendation: st
                     summary = result["candidates"][0]["content"]["parts"][0]["text"].strip()
                 else:
                     summary = result["choices"][0]["message"]["content"].strip()
-
                 async with aiosqlite.connect(DB_NAME) as db:
                     await db.execute(
                         "INSERT OR REPLACE INTO ai_cache (inn, summary, created_at) VALUES (?, ?, ?)",
@@ -535,7 +571,6 @@ def get_risk_assessment(data: dict, arbitration_data: dict | None = None):
     risk_factors = []
     warnings = []
     mass_flags = []
-
     # Возраст компании
     reg_date_str = data.get('ДатаРег') or data.get('reg_date', '')
     if reg_date_str:
@@ -553,13 +588,11 @@ def get_risk_assessment(data: dict, arbitration_data: dict | None = None):
                 risk_factors.append("🟡 Молодая компания")
         except:
             pass
-
     # Массовый адрес
     if data.get("ЮрАдрес", {}).get("МассАдрес"):
         score -= 30
         risk_factors.append("🚨 Массовый юридический адрес")
         mass_flags.append("Массовый адрес")
-
     # НОВОЕ: Массовый руководитель
     ruk = data.get("Руковод") or data.get("director")
     if isinstance(ruk, dict) and ruk.get("МассРук"):
@@ -568,12 +601,10 @@ def get_risk_assessment(data: dict, arbitration_data: dict | None = None):
     elif isinstance(ruk, list) and any(isinstance(r, dict) and r.get("МассРук") for r in ruk):
         score -= 25
         risk_factors.append("🚨 Массовый руководитель")
-
     # НОВОЕ: Массовые учредители
     if data.get("МассУчред") or "массов" in str(data.get("Учред", "")).lower():
         score -= 20
         risk_factors.append("🚨 Массовые учредители")
-
     # Арбитраж
     arb_count = 0
     if arbitration_data and isinstance(arbitration_data, dict):
@@ -581,13 +612,10 @@ def get_risk_assessment(data: dict, arbitration_data: dict | None = None):
         if arb_count > 0:
             score -= min(45, arb_count * 8)
             risk_factors.append(f"⚖️ Арбитражные дела: {arb_count} шт.")
-
     if score > 85 and not risk_factors:
         risk_factors.append("✅ Критических рисков не обнаружено")
-
     color = colors.green if score > 75 else colors.orange if score > 45 else colors.red
     recommendation = "✅ Рекомендуется к работе" if score > 80 else "🟡 Требует дополнительной проверки" if score >= 60 else "🚫 Высокий риск!"
-
     return score, risk_factors, warnings, color, recommendation, arbitration_data, mass_flags
 
 def is_individual_entrepreneur(data: dict) -> bool:
@@ -639,7 +667,66 @@ def get_arbitration_cases_table(arbitration_data: dict | None) -> list:
         table.append([date_str, amount, plaintiff, defendant, status])
     return table
 
-# ================= PREMIUM PDF (улучшенный дизайн v2.9) =================
+# ================= GRAPH HELPERS FOR PDF (TOP-3) =================
+def draw_score_trend(c, x, y, history):
+    """Простой бар + линия график динамики индекса (чисто reportlab, без доп. библиотек)"""
+    if not history or len(history) < 2:
+        c.setFont(FONT_NAME, 10)
+        c.setFillColor(colors.grey)
+        c.drawString(x, y - 15, "История пока недостаточна для графика")
+        return y - 45
+    # history приходит newest-first → разворачиваем для графика (oldest left)
+    history = history[::-1][-10:]  # максимум 10 точек
+    n = len(history)
+    max_h = 140
+    bar_w = 28
+    spacing = 45
+    chart_w = n * spacing
+    # Заголовок
+    c.setFont(FONT_NAME, 12)
+    c.setFillColor(colors.HexColor("#0a1f44"))
+    c.drawString(x, y + 5, "📈 ДИНАМИКА ИНДЕКСА БЕЗОПАСНОСТИ")
+    y -= 25
+    # Оси
+    c.setStrokeColor(colors.grey)
+    c.setLineWidth(1)
+    c.line(x, y - max_h, x, y)                    # Y
+    c.line(x, y - max_h, x + chart_w + 20, y - max_h)  # X
+    # Метки Y
+    c.setFont(FONT_NAME, 8)
+    for val in [0, 50, 100]:
+        yy = y - max_h + (val / 100 * max_h)
+        c.drawString(x - 22, yy - 3, str(val))
+        c.line(x - 5, yy, x, yy)
+    # Бары + линия
+    prev_x = None
+    prev_yy = None
+    for i, (ts, score, *_) in enumerate(history):
+        bar_x = x + i * spacing
+        bar_h = (score / 100) * max_h
+        bar_color = colors.HexColor("#00c853") if score > 75 else colors.HexColor("#ffa726") if score > 45 else colors.HexColor("#ef5350")
+        c.setFillColor(bar_color)
+        c.rect(bar_x, y - max_h, bar_w, bar_h, fill=1, stroke=1)
+        # Значение
+        c.setFillColor(colors.black)
+        c.setFont(FONT_NAME, 9)
+        c.drawString(bar_x + 8, y - max_h + bar_h + 5, str(score))
+        # Дата
+        short_date = ts[5:10].replace('-', '.')
+        c.setFont(FONT_NAME, 7)
+        c.drawString(bar_x + 6, y - max_h - 18, short_date)
+        # Соединительная линия
+        curr_x = bar_x + bar_w / 2
+        curr_yy = y - max_h + bar_h
+        if prev_x is not None:
+            c.setStrokeColor(colors.blue)
+            c.setLineWidth(1.5)
+            c.line(prev_x, prev_yy, curr_x, curr_yy)
+        prev_x = curr_x
+        prev_yy = curr_yy
+    return y - max_h - 50
+
+# ================= PREMIUM PDF (улучшенный дизайн v2.9 + TOP-3 графики) =================
 def draw_multiline(c, x, y, text, font_size=10, max_width=480, line_height=14):
     if not text:
         return y
@@ -659,12 +746,12 @@ def draw_multiline(c, x, y, text, font_size=10, max_width=480, line_height=14):
 
 def create_pro_pdf(data: dict, score: int, risks: list, warnings: list, color: colors,
                    recommendation: str, arbitration_data: dict | None, mass_flags: list,
-                   is_premium: bool, cache_time: str | None = None, ai_summary: str | None = None):
-    """Премиум PDF v2.9 — добавлен AI-анализ, улучшенный дизайн, водяной знак"""
+                   is_premium: bool, cache_time: str | None = None, ai_summary: str | None = None,
+                   history: list | None = None):
+    """Премиум PDF v2.9 — добавлен AI-анализ + графики истории изменений (TOP-3)"""
     buffer = BytesIO()
     c = canvas.Canvas(buffer, pagesize=A4)
     y = 800
-
     # Header
     c.setFillColor(colors.HexColor("#0a1f44"))
     c.rect(0, y + 10, 595, 70, fill=1, stroke=0)
@@ -673,30 +760,23 @@ def create_pro_pdf(data: dict, score: int, risks: list, warnings: list, color: c
     c.drawString(45, y + 45, "OSINT PRO")
     c.setFont(FONT_NAME, 11)
     c.drawString(45, y + 28, f"ПРОФЕССИОНАЛЬНЫЙ АНАЛИТИЧЕСКИЙ ОТЧЁТ v{VERSION}")
-
     if is_premium:
         c.setFillColor(colors.HexColor("#00c853"))
         c.setFont(FONT_NAME, 13)
         c.drawString(420, y + 48, "PREMIUM")
-
     c.setFillColor(colors.white)
     c.setFont(FONT_NAME, 10)
     c.drawString(45, y + 12, f"{datetime.now().strftime('%d.%m.%Y %H:%M')} • Checko.ru + ЕГРЮЛ + AI")
-
     y -= 85
-
     full_name = data.get('НаимПолн') or data.get('full_name') or "Н/Д"
     status_text, status_emoji = get_company_status(data)
-
     c.setFont(FONT_NAME, 18)
     c.setFillColor(colors.black)
     y = draw_multiline(c, 45, y, f"{status_emoji} {full_name}", font_size=18, max_width=500, line_height=22)
-
     y -= 12
     c.setFont(FONT_NAME, 14)
     c.setFillColor(colors.HexColor("#0a1f44"))
     c.drawString(45, y, "ИНДЕКС БЕЗОПАСНОСТИ")
-
     # Progress bar
     bar_width = 280
     bar_height = 28
@@ -706,32 +786,26 @@ def create_pro_pdf(data: dict, score: int, risks: list, warnings: list, color: c
     fill_width = (score / 100) * bar_width
     c.setFillColor(color)
     c.roundRect(45, y - 38, fill_width, bar_height, 6, stroke=0, fill=1)
-
     c.setFont(FONT_NAME, 32)
     c.setFillColor(colors.black)
     c.drawString(360, y - 33, f"{score}")
     c.setFont(FONT_NAME, 14)
     c.drawString(415, y - 33, "/100")
-
     risk_label = "НИЗКИЙ РИСК" if score > 75 else "СРЕДНИЙ РИСК" if score > 45 else "ВЫСОКИЙ РИСК"
     risk_color = colors.green if score > 75 else colors.orange if score > 45 else colors.red
     c.setFillColor(risk_color)
     c.setFont(FONT_NAME, 11)
     c.drawString(360, y - 55, risk_label)
-
     y -= 85
-
     # Ключевые факты
     c.setFont(FONT_NAME, 13)
     c.setFillColor(colors.HexColor("#0a1f44"))
     c.drawString(45, y, "КЛЮЧЕВЫЕ ФАКТЫ")
     y -= 28
-
     is_ip_flag = is_individual_entrepreneur(data)
     director = safe_get_director(data)
     branches = safe_get_branches(data)
     okved = safe_get_okved(data)
-
     if is_ip_flag:
         table_data = [
             ["Параметр", "Значение"],
@@ -755,7 +829,6 @@ def create_pro_pdf(data: dict, score: int, risks: list, warnings: list, color: c
             ["Филиалы", f"{branches} шт." if branches else "—"],
             ["ОКВЭД", okved],
         ]
-
     table = Table(table_data, colWidths=[170, 300])
     table.setStyle(TableStyle([
         ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor("#0a1f44")),
@@ -774,6 +847,32 @@ def create_pro_pdf(data: dict, score: int, risks: list, warnings: list, color: c
     table.wrapOn(c, 45, y)
     table.drawOn(c, 45, y - table._height)
     y -= table._height + 35
+
+    # НОВОЕ: График истории + таймлайн (TOP-3)
+    if history and len(history) > 0:
+        c.setFont(FONT_NAME, 13)
+        c.setFillColor(colors.HexColor("#0a1f44"))
+        c.drawString(45, y, "📈 ДИНАМИКА И ИСТОРИЯ КОМПАНИИ")
+        y -= 35
+        y = draw_score_trend(c, 45, y, history)
+        # Таймлайн (последние записи)
+        timeline_data = [["Дата", "Индекс", "Арбитраж", "Статус"]]
+        for ts, sc, arb, st, _ in history[:5]:
+            date_str = datetime.fromisoformat(ts.replace("Z", "+00:00")).strftime("%d.%m")
+            timeline_data.append([date_str, str(sc), str(arb), st[:22]])
+        if len(timeline_data) > 1:
+            tl_table = Table(timeline_data, colWidths=[60, 55, 70, 280])
+            tl_table.setStyle(TableStyle([
+                ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor("#0a1f44")),
+                ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
+                ('GRID', (0, 0), (-1, -1), 1, colors.lightgrey),
+                ('FONTNAME', (0, 0), (-1, -1), FONT_NAME),
+                ('FONTSIZE', (0, 0), (-1, -1), 9),
+                ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor("#f8f9fa")]),
+            ]))
+            tl_table.wrapOn(c, 45, y)
+            tl_table.drawOn(c, 45, y - tl_table._height)
+            y -= tl_table._height + 25
 
     # Контакты
     contacts = data.get("Контакты") or []
@@ -809,7 +908,6 @@ def create_pro_pdf(data: dict, score: int, risks: list, warnings: list, color: c
         ct.wrapOn(c, 45, y)
         ct.drawOn(c, 45, y - ct._height)
         y -= ct._height + 30
-
     # Учредители
     uchred = data.get("Учред", {})
     if uchred and uchred.get("ФЛ"):
@@ -831,7 +929,6 @@ def create_pro_pdf(data: dict, score: int, risks: list, warnings: list, color: c
         ft.wrapOn(c, 45, y)
         ft.drawOn(c, 45, y - ft._height)
         y -= ft._height + 30
-
     # Риски
     all_risks = warnings + mass_flags + risks
     if all_risks:
@@ -854,7 +951,6 @@ def create_pro_pdf(data: dict, score: int, risks: list, warnings: list, color: c
         rt.wrapOn(c, 45, y)
         rt.drawOn(c, 45, y - rt._height)
         y -= rt._height + 30
-
     # Арбитраж
     arb_table_data = get_arbitration_cases_table(arbitration_data)
     if len(arb_table_data) > 1:
@@ -875,8 +971,7 @@ def create_pro_pdf(data: dict, score: int, risks: list, warnings: list, color: c
         arb_table.wrapOn(c, 45, y)
         arb_table.drawOn(c, 45, y - arb_table._height)
         y -= arb_table._height + 30
-
-    # НОВОЕ: AI-анализ в PDF
+    # AI-анализ в PDF
     if ai_summary:
         c.setFont(FONT_NAME, 13)
         c.setFillColor(colors.HexColor("#0a1f44"))
@@ -884,7 +979,6 @@ def create_pro_pdf(data: dict, score: int, risks: list, warnings: list, color: c
         y -= 25
         y = draw_multiline(c, 45, y, ai_summary, font_size=10, max_width=480, line_height=14)
         y -= 20
-
     # Рекомендация
     c.setStrokeColor(color)
     c.setLineWidth(3)
@@ -895,7 +989,6 @@ def create_pro_pdf(data: dict, score: int, risks: list, warnings: list, color: c
     c.setFillColor(colors.black)
     c.setFont(FONT_NAME, 11)
     y = draw_multiline(c, 65, y - 45, recommendation, font_size=11, max_width=460, line_height=16)
-
     # Footer
     c.setFont(FONT_NAME, 8)
     c.setFillColor(colors.grey)
@@ -908,7 +1001,6 @@ def create_pro_pdf(data: dict, score: int, risks: list, warnings: list, color: c
             pass
     c.drawString(45, 35, footer)
     c.drawString(380, 35, "Для внутренних целей • Не для перепродажи")
-
     # Водяной знак PREMIUM
     if is_premium:
         c.saveState()
@@ -918,7 +1010,6 @@ def create_pro_pdf(data: dict, score: int, risks: list, warnings: list, color: c
         c.rotate(35)
         c.drawString(100, -150, "PREMIUM")
         c.restoreState()
-
     c.showPage()
     c.save()
     buffer.seek(0)
@@ -967,7 +1058,6 @@ async def handle_mass_check_document(message: Message):
     document = message.document
     if not document.file_name.lower().endswith(('.xlsx', '.csv')):
         return await message.answer("❌ Поддерживаются только файлы **.xlsx** и **.csv**")
-
     subscribed = await is_subscribed(message.from_user.id)
     if not subscribed:
         kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="💰 Купить подписку", callback_data="buy")]])
@@ -976,14 +1066,11 @@ async def handle_mass_check_document(message: Message):
             "Безлимит + Excel-отчёт по сотням компаний — 4900 ₽/мес",
             reply_markup=kb
         )
-
     wait_msg = await message.answer("📤 **Обрабатываю файл...**\n0% (0/0)")
-
     file = await bot.get_file(document.file_id)
     file_bytes = BytesIO()
     await bot.download_file(file.file_path, file_bytes)
     file_bytes.seek(0)
-
     try:
         if document.file_name.lower().endswith('.csv'):
             df = pd.read_csv(file_bytes)
@@ -992,7 +1079,6 @@ async def handle_mass_check_document(message: Message):
     except Exception:
         await wait_msg.edit_text("❌ Не удалось прочитать файл.")
         return
-
     # Поиск колонки с ИНН
     inn_col = None
     for col in df.columns:
@@ -1004,38 +1090,31 @@ async def handle_mass_check_document(message: Message):
         df['inn'] = df.iloc[:, 0].astype(str).str.strip()
     else:
         df['inn'] = df[inn_col].astype(str).str.strip()
-
     inns = []
     for val in df['inn']:
         clean = re.sub(r'\D', '', str(val))
         if len(clean) in (10, 12):
             inns.append(clean)
     inns = list(dict.fromkeys(inns))[:100]
-
     if not inns:
         await wait_msg.edit_text("❌ В файле не найдено валидных ИНН.")
         return
-
     results = []
     total = len(inns)
-
     for i, inn in enumerate(inns):
         if i % 10 == 0 or i == total - 1:
             percent = int(((i + 1) / total) * 100)
             await wait_msg.edit_text(f"📤 **Обрабатываю файл...** {percent}% ({i + 1}/{total})")
-
         data, arbitration_data, _ = await get_company_data(inn)
         if not data:
             results.append({"ИНН": inn, "Название": "Не найдено", "Статус": "—", "Индекс безопасности": 0,
                             "Рекомендация": "Данные отсутствуют", "Арбитражных дел": 0,
                             "Руководитель": "—", "Дата регистрации": "—"})
             continue
-
         score, _, _, _, recommendation, _, _ = get_risk_assessment(data, arbitration_data)
         name = data.get('НаимСокр') or data.get('full_name') or data.get('НаимПолн') or "—"
         status = get_company_status(data)[0]
         arb_count = len(arbitration_data.get("cases", [])) if arbitration_data and isinstance(arbitration_data, dict) else 0
-
         results.append({
             "ИНН": inn,
             "Название": name,
@@ -1046,20 +1125,17 @@ async def handle_mass_check_document(message: Message):
             "Руководитель": safe_get_director(data),
             "Дата регистрации": calculate_age(data.get('ДатаРег', ''))
         })
-
     result_df = pd.DataFrame(results)
     excel_buffer = BytesIO()
     with pd.ExcelWriter(excel_buffer, engine='openpyxl') as writer:
         result_df.to_excel(writer, sheet_name="OSINT PRO — Массовый отчёт", index=False)
     excel_buffer.seek(0)
-
     total = len(results)
     risky = len([r for r in results if r["Индекс безопасности"] < 60])
     summary = (f"✅ **Массовый отчёт OSINT PRO v{VERSION} готов!**\n\n"
                f"📊 Проверено компаний: **{total}**\n"
                f"🔴 Высокий риск: **{risky}**\n"
                f"✅ Нормальный/низкий риск: **{total - risky}**")
-
     await wait_msg.delete()
     await message.answer_document(
         BufferedInputFile(excel_buffer.read(), filename=f"OSINT_PRO_mass_check_{datetime.now().strftime('%Y-%m-%d_%H-%M')}.xlsx"),
@@ -1076,7 +1152,7 @@ async def cmd_start(message: Message):
             "📌 **Возможности Pro:**\n"
             "• Мониторинг изменений (уведомления)\n"
             "• Массовая проверка Excel/CSV (до 100)\n"
-            "• Полный PDF с AI-саммари\n"
+            "• Полный PDF с AI-саммари + графиками\n"
             "• Безлимит + поддержка\n\n"
             "Пришлите ИНН / ОГРН или название компании")
     if is_admin:
@@ -1143,33 +1219,33 @@ async def admin_revoke_start(call: CallbackQuery):
 async def handle_search(message: Message):
     text = message.text.strip()
     inn = "".join(re.findall(r'\d+', text))
-
     if len(inn) in (10, 12):
         can_use, remaining, is_premium = await check_limit(message.from_user.id)
         if not can_use:
             kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="💰 Купить подписку", callback_data="buy")]])
             return await message.answer("🛑 Лимит 3 запроса в день исчерпан.", reply_markup=kb)
-
         wait = await message.answer("🔍 Запрашиваю данные + AI-анализ...")
         data, arbitration_data, cache_time = await get_company_data(inn)
         if not data:
             return await wait.edit_text("❌ Данные по ИНН не найдены.")
-
         score, risks, warnings, color, recommendation, arbitration_data, mass_flags = get_risk_assessment(data, arbitration_data)
         await log_usage(message.from_user.id, inn, score, is_premium)
         log_to_sheet(message.from_user.id, inn, score)
-
+        # НОВОЕ: сохраняем историю для графиков в PDF
+        arb_count_hist = 0
+        if arbitration_data and isinstance(arbitration_data, dict):
+            arb_count_hist = arbitration_data.get("total", 0) or len(arbitration_data.get("cases", []))
+        status_text_hist, _ = get_company_status(data)
+        director_hist = safe_get_director(data)
+        await save_to_history(inn, score, arb_count_hist, status_text_hist, director_hist)
         ai_summary = await get_ai_summary(data, score, risks, recommendation, arbitration_data)
-
         is_mon = await is_monitored(message.from_user.id, inn)
         monitor_text = "❌ Убрать из мониторинга" if is_mon else "📌 Добавить в мониторинг"
         monitor_cb = f"monitor_remove_{inn}" if is_mon else f"monitor_add_{inn}"
-
         is_ip_flag = is_individual_entrepreneur(data)
         company_name = data.get('НаимСокр') or data.get('short_name') or data.get('full_name') or '—'
         director = safe_get_director(data)
         founders_count = safe_get_founders_count(data)
-
         res = f"✅ **OSINT PRO v{VERSION}**{' PREM' if is_premium else ''}\n\n"
         res += f"🏢 {'ИП' if is_ip_flag else 'ЮЛ'} `{company_name}`\n"
         res += f"📋 ИНН `{data.get('ИНН', inn)}` | ОГРН `{data.get('ОГРН', '—')}`\n\n"
@@ -1187,7 +1263,6 @@ async def handle_search(message: Message):
         if not is_premium:
             res += f"Осталось бесплатных запросов: **{remaining}/3**\n\n"
         res += "📄 **Полный профессиональный отчёт в PDF**"
-
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="📥 Скачать PDF", callback_data=f"pdf_{inn}")],
             [InlineKeyboardButton(text="🔄 Обновить данные", callback_data=f"refresh_{inn}")],
@@ -1196,13 +1271,11 @@ async def handle_search(message: Message):
         await wait.delete()
         await message.answer(res, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
         return
-
     # Поиск по названию
     wait = await message.answer("🔎 Ищу компании по названию...")
     results = await search_by_name(text)
     if not results:
         return await wait.edit_text("❌ Компании с таким названием не найдены.")
-
     kb = InlineKeyboardMarkup(inline_keyboard=[])
     for item in results[:8]:
         inn_found = item.get("ИНН") or item.get("inn")
@@ -1218,28 +1291,23 @@ async def handle_search(message: Message):
 async def handle_select(call: CallbackQuery):
     inn = call.data.split("_", 1)[1]
     await call.answer("Открываю отчёт...")
-
     can_use, remaining, is_premium = await check_limit(call.from_user.id)
     if not can_use:
         kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="💰 Купить подписку", callback_data="buy")]])
         return await call.message.answer("🛑 Лимит 3 запроса в день исчерпан.", reply_markup=kb)
-
     try:
         data, arbitration_data, cache_time = await get_company_data(inn)
         if not data:
             return await call.message.answer("❌ Данные не найдены.")
-
         score, risks, warnings, color, recommendation, arbitration_data, mass_flags = get_risk_assessment(data, arbitration_data)
         ai_summary = await get_ai_summary(data, score, risks, recommendation, arbitration_data)
-
         await log_usage(call.from_user.id, inn, score, is_premium)
         log_to_sheet(call.from_user.id, inn, score)
-
+        history = await get_company_history(inn)
         pdf_buffer = create_pro_pdf(
             data, score, risks, warnings, color, recommendation,
-            arbitration_data, mass_flags, is_premium, cache_time, ai_summary
+            arbitration_data, mass_flags, is_premium, cache_time, ai_summary, history
         )
-
         await call.message.answer_document(
             BufferedInputFile(pdf_buffer.read(), filename=f"OSINT_PRO_{inn}_v{VERSION}.pdf"),
             caption="✅ Подробный профессиональный отчёт OSINT PRO v{VERSION}"
@@ -1252,21 +1320,18 @@ async def handle_select(call: CallbackQuery):
 async def send_pdf(call: CallbackQuery):
     inn = call.data.split("_", 1)[1]
     await call.answer("Генерирую PDF...")
-
     try:
         data, arbitration_data, cache_time = await get_company_data(inn)
         if not data:
             raise ValueError("Нет данных")
-
         is_premium = await is_subscribed(call.from_user.id)
         score, risks, warnings, color, recommendation, arbitration_data, mass_flags = get_risk_assessment(data, arbitration_data)
         ai_summary = await get_ai_summary(data, score, risks, recommendation, arbitration_data)
-
+        history = await get_company_history(inn)
         pdf_buffer = create_pro_pdf(
             data, score, risks, warnings, color, recommendation,
-            arbitration_data, mass_flags, is_premium, cache_time, ai_summary
+            arbitration_data, mass_flags, is_premium, cache_time, ai_summary, history
         )
-
         await call.message.answer_document(
             BufferedInputFile(pdf_buffer.read(), filename=f"OSINT_PRO_{inn}_v{VERSION}.pdf"),
             caption="✅ Подробный профессиональный отчёт OSINT PRO v{VERSION}"
@@ -1349,14 +1414,11 @@ async def cmd_profile(message: Message):
             async with db.execute("SELECT until_date FROM subscriptions WHERE user_id = ?", (message.from_user.id,)) as cur:
                 row = await cur.fetchone()
                 until = f" до {row[0]}" if row else ""
-
     text = f"""👤 **Ваш профиль OSINT PRO v{VERSION}**
-
 📅 Подписка: {'✅ Активна' + until if subscribed else '❌ Нет (бесплатный режим)'}
 🛡️ Остаток запросов сегодня: {'∞' if is_premium else f'{remaining}/{FREE_LIMIT}'}
 📌 Компаний в мониторинге: {monitored_count}
 🔥 Запросов сегодня: {await get_today_queries(message.from_user.id)}
-
 💎 Хотите безлимит и премиум-PDF? Нажмите /buy"""
     await message.answer(text, parse_mode=ParseMode.MARKDOWN)
 
@@ -1430,7 +1492,7 @@ async def main():
     await runner.setup()
     site = web.TCPSite(runner, '0.0.0.0', int(os.environ.get("PORT", 10000)))
     await site.start()
-    logger.info("✅ Webhook + мониторинг + AI + премиум-PDF запущены")
+    logger.info("✅ Webhook + мониторинг + AI + премиум-PDF + графики запущены")
     await asyncio.Event().wait()
 
 if __name__ == "__main__":
