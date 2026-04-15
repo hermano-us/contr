@@ -20,8 +20,8 @@ from reportlab.pdfgen import canvas
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.lib import colors
-from reportlab.platypus import Table, TableStyle
-
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 # ================= CONFIG =================
 TOKEN = os.environ.get("TOKEN")
 ADMIN_CHAT_ID = int(os.environ.get("ADMIN_CHAT_ID", 0))
@@ -29,34 +29,27 @@ WEBHOOK_URL = os.environ.get("WEBHOOK_URL")
 GOOGLE_CREDENTIALS = os.environ.get("GOOGLE_CREDENTIALS")
 SHEET_ID = os.environ.get("SHEET_ID")
 CHECKO_API_KEY = os.environ.get("CHECKO_API_KEY")
-
 # ================= AI CONFIG (Gemini — бесплатный + OpenAI/XAI fallback) =================
 AI_PROVIDER = os.environ.get("AI_PROVIDER", "gemini").lower()
 AI_API_KEY = os.environ.get("AI_API_KEY")
 AI_MODEL = os.environ.get("AI_MODEL", "gemini-2.5-flash")
-
 DB_NAME = "osint_pro.db"
 FREE_LIMIT = 3
 SUBSCRIPTION_PRICE = "4900 ₽/мес"
 MONITORING_INTERVAL_HOURS = 4
 VERSION = "2.9 PREMIUM"
-
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 logger = logging.getLogger(__name__)
-
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
-
 if CHECKO_API_KEY:
     logger.info("✅ Checko API подключён — полный доступ к арбитражу и данным")
 else:
     logger.warning("⚠️ CHECKO_API_KEY не задан — некоторые функции ограничены")
-
 if AI_API_KEY:
     logger.info(f"✅ AI подключён → {AI_PROVIDER.upper()} / {AI_MODEL} (кэш 24ч)")
 else:
     logger.warning("⚠️ AI_API_KEY не задан — AI-анализ отключён")
-
 # ================= FONT =================
 FONT_NAME = "DejaVuSans"
 FONT_PATH = "DejaVuSans.ttf"
@@ -66,7 +59,6 @@ if os.path.exists(FONT_PATH):
 else:
     logger.error("❌ DejaVuSans.ttf не найден! Используем Helvetica")
     FONT_NAME = "Helvetica"
-
 # ================= DATABASE =================
 async def init_db():
     """Инициализация всех таблиц + миграции + индексы для высокой производительности"""
@@ -124,7 +116,6 @@ async def init_db():
         await db.execute("CREATE INDEX IF NOT EXISTS idx_history_inn ON company_history(inn)")
         await db.commit()
     logger.info("✅ База данных инициализирована (все таблицы + индексы + company_history)")
-
 async def is_subscribed(user_id: int) -> bool:
     async with aiosqlite.connect(DB_NAME) as db:
         async with db.execute("SELECT until_date FROM subscriptions WHERE user_id = ?", (user_id,)) as cursor:
@@ -132,7 +123,6 @@ async def is_subscribed(user_id: int) -> bool:
             if not row or not row[0]:
                 return False
             return datetime.strptime(row[0], '%Y-%m-%d').date() >= date.today()
-
 async def check_limit(user_id: int) -> tuple[bool, int, bool]:
     """Проверка лимита (премиум = ∞)"""
     subscribed = await is_subscribed(user_id)
@@ -152,7 +142,6 @@ async def check_limit(user_id: int) -> tuple[bool, int, bool]:
     except Exception as e:
         logger.error(f"DB Error in check_limit: {e}")
         return True, FREE_LIMIT, False
-
 async def log_usage(user_id: int, inn: str, score: int, is_premium: bool):
     async with aiosqlite.connect(DB_NAME) as db:
         await db.execute(
@@ -162,19 +151,16 @@ async def log_usage(user_id: int, inn: str, score: int, is_premium: bool):
         await db.commit()
     if is_premium:
         logger.info(f"💎 Платный запрос | user={user_id} | ИНН={inn} | score={score}")
-
 # ================= ADMIN FUNCTIONS =================
 async def grant_subscription(user_id: int, days: int):
     until = (date.today() + timedelta(days=days)).isoformat()
     async with aiosqlite.connect(DB_NAME) as db:
         await db.execute("INSERT OR REPLACE INTO subscriptions (user_id, until_date) VALUES (?, ?)", (user_id, until))
         await db.commit()
-
 async def revoke_subscription(user_id: int):
     async with aiosqlite.connect(DB_NAME) as db:
         await db.execute("DELETE FROM subscriptions WHERE user_id = ?", (user_id,))
         await db.commit()
-
 async def get_stats() -> str:
     try:
         async with aiosqlite.connect(DB_NAME) as db:
@@ -192,7 +178,6 @@ async def get_stats() -> str:
     except Exception as e:
         logger.error(f"Stats error: {e}")
         return "❌ Ошибка получения статистики"
-
 # ================= CACHE =================
 async def get_from_cache(inn: str) -> tuple[dict | None, dict | None, str | None]:
     try:
@@ -212,7 +197,6 @@ async def get_from_cache(inn: str) -> tuple[dict | None, dict | None, str | None
     except Exception as e:
         logger.error(f"Cache read error: {e}")
     return None, None, None
-
 async def save_to_cache(inn: str, data: dict | None, arbitration_data: dict | None):
     if not data:
         return
@@ -229,7 +213,6 @@ async def save_to_cache(inn: str, data: dict | None, arbitration_data: dict | No
             await db.commit()
     except Exception as e:
         logger.error(f"Cache save error: {e}")
-
 async def get_company_data(inn: str, force_refresh: bool = False) -> tuple[dict | None, dict | None, str | None]:
     if not force_refresh:
         cached_data, cached_arb, cached_at = await get_from_cache(inn)
@@ -244,7 +227,6 @@ async def get_company_data(inn: str, force_refresh: bool = False) -> tuple[dict 
     else:
         cached_at = None
     return data, arbitration_data, cached_at
-
 # ================= HISTORY FOR PDF GRAPHS (TOP-3) =================
 async def save_to_history(inn: str, score: int, arb_count: int, status: str, director: str):
     """Сохраняет точку истории только если прошло ≥30 минут с последнего сохранения (чтобы не раздувать БД)"""
@@ -258,10 +240,10 @@ async def save_to_history(inn: str, score: int, arb_count: int, status: str, dir
                 row = await cursor.fetchone()
                 if row:
                     last_ts = datetime.fromisoformat(row[0].replace("Z", "+00:00"))
-                    if (datetime.now() - last_ts).total_seconds() < 1800:  # 30 минут
+                    if (datetime.now() - last_ts).total_seconds() < 1800: # 30 минут
                         return
             await db.execute(
-                """INSERT INTO company_history 
+                """INSERT INTO company_history
                    (inn, timestamp, score, arb_count, status, director)
                    VALUES (?, ?, ?, ?, ?, ?)""",
                 (inn, datetime.now().isoformat(), score, arb_count, status, director)
@@ -269,15 +251,14 @@ async def save_to_history(inn: str, score: int, arb_count: int, status: str, dir
             await db.commit()
     except Exception as e:
         logger.error(f"History save error for {inn}: {e}")
-
 async def get_company_history(inn: str, limit: int = 12) -> list:
     """Возвращает историю по ИНН (новейшие сверху) для графиков и таймлайна в PDF"""
     try:
         async with aiosqlite.connect(DB_NAME) as db:
             async with db.execute(
-                """SELECT timestamp, score, arb_count, status, director 
-                   FROM company_history 
-                   WHERE inn = ? 
+                """SELECT timestamp, score, arb_count, status, director
+                   FROM company_history
+                   WHERE inn = ?
                    ORDER BY timestamp DESC LIMIT ?""",
                 (inn, limit)
             ) as cursor:
@@ -285,7 +266,6 @@ async def get_company_history(inn: str, limit: int = 12) -> list:
     except Exception as e:
         logger.error(f"History read error: {e}")
         return []
-
 # ================= MONITORING SYSTEM =================
 async def is_monitored(user_id: int, inn: str) -> bool:
     try:
@@ -295,7 +275,6 @@ async def is_monitored(user_id: int, inn: str) -> bool:
     except Exception as e:
         logger.error(f"Monitor check error: {e}")
         return False
-
 async def get_user_monitored(user_id: int):
     try:
         async with aiosqlite.connect(DB_NAME) as db:
@@ -307,7 +286,6 @@ async def get_user_monitored(user_id: int):
     except Exception as e:
         logger.error(f"Get monitored error: {e}")
         return []
-
 async def add_to_monitoring(user_id: int, inn: str) -> bool:
     try:
         data, arbitration_data, _ = await get_company_data(inn, force_refresh=True)
@@ -334,7 +312,6 @@ async def add_to_monitoring(user_id: int, inn: str) -> bool:
     except Exception as e:
         logger.error(f"Add to monitoring error: {e}")
         return False
-
 async def remove_from_monitoring(user_id: int, inn: str):
     try:
         async with aiosqlite.connect(DB_NAME) as db:
@@ -342,7 +319,6 @@ async def remove_from_monitoring(user_id: int, inn: str):
             await db.commit()
     except Exception as e:
         logger.error(f"Remove from monitoring error: {e}")
-
 async def check_monitored_companies():
     """Проверка всех компаний в мониторинге + уведомления об изменениях"""
     start = datetime.now()
@@ -414,13 +390,11 @@ async def check_monitored_companies():
             continue
     duration = (datetime.now() - start).total_seconds()
     logger.info(f"✅ Мониторинг завершён за {duration:.1f} сек. Изменений: {changes_count}")
-
 async def monitoring_scheduler():
     """Улучшенный планировщик: запускается каждые MONITORING_INTERVAL_HOURS"""
     while True:
         await check_monitored_companies()
         await asyncio.sleep(MONITORING_INTERVAL_HOURS * 3600)
-
 # ================= AI ANALYSIS =================
 async def get_ai_summary(data: dict, score: int, risks: list, recommendation: str, arbitration_data: dict | None = None) -> str:
     if not AI_API_KEY:
@@ -478,7 +452,126 @@ async def get_ai_summary(data: dict, score: int, risks: list, recommendation: st
     except Exception as e:
         logger.error(f"AI summary error: {e}")
         return "🔹 AI-анализ временно недоступен (техническая ошибка)"
+# ================= FINANCIAL ANALYZER + ALTMAN Z-SCORE MODEL =================
+class FinancialAnalyzer:
+    """Профессиональный финансовый анализ + модель Альтмана Z-score (для PDF Enterprise)"""
+    def __init__(self, finance_data: list):
+        self.df = pd.DataFrame(finance_data) if finance_data else pd.DataFrame()
 
+    def get_altman_z_score(self, assets, equity, retained_earnings, ebit, revenue, total_liabilities):
+        if assets <= 0:
+            return 0.0
+        x1 = (assets - total_liabilities) / assets
+        x2 = retained_earnings / assets
+        x3 = ebit / assets
+        x4 = equity / total_liabilities if total_liabilities > 0 else 0
+        z = 6.56 * x1 + 3.26 * x2 + 6.72 * x3 + 1.05 * x4
+        return round(z, 2)
+
+    def analyze_latest_year(self):
+        if self.df.empty:
+            return {"z_score": 0, "status": "Нет финансовых данных", "ros": 0, "autonomy": 0}
+        latest = self.df.iloc[-1]
+        revenue = latest.get('revenue', 0)
+        net_profit = latest.get('net_profit', 0)
+        assets = latest.get('assets', 1)
+        equity = latest.get('equity', 0)
+        liabilities = latest.get('total_liabilities', 1)
+        ros = (net_profit / revenue * 100) if revenue > 0 else 0
+        autonomy = equity / assets
+        z_score = self.get_altman_z_score(assets, equity, latest.get('retained_earnings', 0),
+                                          latest.get('ebit', net_profit), revenue, liabilities)
+        if z_score > 2.6:
+            status = "✅ Зеленая зона (Низкий риск банкротства)"
+        elif 1.1 <= z_score <= 2.6:
+            status = "🟡 Серая зона (Средний риск)"
+        else:
+            status = "🚨 Красная зона (Высокий риск банкротства)"
+        return {"z_score": z_score, "status": status, "ros": round(ros, 2), "autonomy": round(autonomy, 2)}
+# ================= ADVANCED RISK ASSESSMENT v3.0 =================
+async def get_advanced_risk_assessment(data: dict, arbitration_data: dict, finance_data: list = None, tax_blocks: list = None):
+    """Расширенная оценка рисков v3.0 с финансовым анализом и моделью Альтмана (для Enterprise PDF)"""
+    if finance_data is None:
+        finance_data = []
+    if tax_blocks is None:
+        tax_blocks = []
+    score = 100
+    risk_factors = []
+    # Возраст компании
+    reg_date_str = data.get('ДатаРег', '')
+    if reg_date_str:
+        try:
+            years = (datetime.now() - datetime.strptime(reg_date_str[:10], '%Y-%m-%d')).days / 365.25
+            if years < 1:
+                score -= 35
+                risk_factors.append("⚠️ Компания существует менее 1 года")
+        except:
+            pass
+    # Блокировки ФНС
+    if tax_blocks:
+        score -= 40
+        risk_factors.append(f"🚨 Блокировки счетов ФНС (БИР): {len(tax_blocks)} шт.")
+    # Финансовый анализ
+    analyzer = FinancialAnalyzer(finance_data)
+    fin_analysis = analyzer.analyze_latest_year()
+    # Исправлено: проверяем наличие данных перед снижением скора (чтобы не штрафовать за отсутствие данных)
+    if fin_analysis['z_score'] < 1.1 and fin_analysis['status'] != "Нет финансовых данных":
+        score -= 25
+        risk_factors.append(f"🚨 Высокий риск банкротства (Z-Altman: {fin_analysis['z_score']})")
+    # Арбитраж (ответчик)
+    arb_cases = arbitration_data.get("cases", []) if isinstance(arbitration_data, dict) else []
+    if arb_cases:
+        defendant_cases = [c for c in arb_cases if str(data.get('ИНН')) in str(c.get('Ответчик', ''))]
+        if len(defendant_cases) > 0:
+            score -= min(40, len(defendant_cases) * 10)
+            risk_factors.append(f"⚖️ Ответчик в {len(defendant_cases)} арбитражных делах")
+    color = colors.green if score > 75 else colors.orange if score > 45 else colors.red
+    rec = "✅ Рекомендуется к работе" if score > 80 else "🟡 Требует проверки" if score >= 60 else "🚫 Высокий риск!"
+    return score, risk_factors, fin_analysis, color, rec
+# ================= AI EXECUTIVE SUMMARY =================
+async def get_ai_executive_summary(data: dict, score: int, risks: list, fin_analysis: dict) -> str:
+    """AI Executive Summary для директоров (более строгий и профессиональный)"""
+    if not AI_API_KEY:
+        return "🔹 AI-анализ временно недоступен"
+    company_name = data.get('НаимПолн', 'Компания')
+    prompt = f"""Ты — Senior Compliance Officer (OSINT PRO v{VERSION}).
+Составь Executive Summary для директора.
+Компания: {company_name} (ИНН: {data.get('ИНН')})
+Индекс надёжности: {score}/100
+Риски: {', '.join(risks)}
+Фин. статус (Альтман): {fin_analysis.get('status', 'Н/Д')}
+Структура ответа (строго):
+1. Вердикт (✅/🟡/🚨)
+2. Признаки 375-П ЦБ РФ (есть/нет)
+3. Рекомендация по лимиту сделки и условиям оплаты
+Пиши кратко, профессионально. Начинай строго с:
+✅ Вывод OSINT PRO AI:"""
+    try:
+        async with aiohttp.ClientSession() as session:
+            if AI_PROVIDER == "gemini":
+                url = f"https://generativelanguage.googleapis.com/v1beta/models/{AI_MODEL}:generateContent?key={AI_API_KEY}"
+                payload = {"contents": [{"parts": [{"text": prompt}]}], "generationConfig": {"temperature": 0.65, "maxOutputTokens": 400}}
+                headers = {"Content-Type": "application/json"}
+            else:
+                url = "https://api.openai.com/v1/chat/completions" if AI_PROVIDER == "openai" else "https://api.x.ai/v1/chat/completions"
+                payload = {"model": AI_MODEL, "messages": [{"role": "user", "content": prompt}], "temperature": 0.65, "max_tokens": 400}
+                headers = {"Content-Type": "application/json", "Authorization": f"Bearer {AI_API_KEY}"}
+            async with session.post(url, json=payload, headers=headers, timeout=18) as resp:
+                if resp.status != 200:
+                    error_text = await resp.text()
+                    logger.error(f"AI API error {resp.status}: {error_text}")
+                    return "🔹 AI Executive Summary временно недоступен"
+                result = await resp.json()
+                if AI_PROVIDER == "gemini":
+                    summary = result["candidates"][0]["content"]["parts"][0]["text"].strip()
+                else:
+                    summary = result["choices"][0]["message"]["content"].strip()
+                if not summary.startswith("✅ Вывод OSINT PRO AI:"):
+                    summary = f"✅ Вывод OSINT PRO AI: {summary}"
+                return summary
+    except Exception as e:
+        logger.error(f"AI executive error: {e}")
+        return "🔹 AI Executive Summary временно недоступен (техническая ошибка)"
 # ================= API =================
 async def get_checko_company(inn: str) -> dict | None:
     if not CHECKO_API_KEY:
@@ -495,7 +588,6 @@ async def get_checko_company(inn: str) -> dict | None:
     except Exception as e:
         logger.error(f"Checko error: {e}")
         return None
-
 async def get_egrul_data(inn: str) -> dict | None:
     try:
         async with aiohttp.ClientSession() as session:
@@ -505,7 +597,6 @@ async def get_egrul_data(inn: str) -> dict | None:
     except Exception:
         pass
     return None
-
 async def get_arbitration_data(inn: str) -> dict | None:
     if not CHECKO_API_KEY:
         return None
@@ -520,7 +611,6 @@ async def get_arbitration_data(inn: str) -> dict | None:
     except Exception as e:
         logger.error(f"Arbitration error: {e}")
         return None
-
 async def search_by_name(query: str) -> list[dict] | None:
     if not CHECKO_API_KEY:
         return None
@@ -536,13 +626,11 @@ async def search_by_name(query: str) -> list[dict] | None:
     except Exception as e:
         logger.error(f"Search by name error: {e}")
         return None
-
 # ================= HELPERS =================
 def get_formatted_address(data: dict) -> str:
     if isinstance(data.get("ЮрАдрес"), dict):
         return data["ЮрАдрес"].get("АдресРФ") or data.get("address", "Н/Д")
     return data.get("address", "Н/Д")
-
 def calculate_age(reg_date_str: str) -> str:
     if not reg_date_str:
         return "Н/Д"
@@ -554,7 +642,6 @@ def calculate_age(reg_date_str: str) -> str:
         return f"{reg_date.strftime('%d.%m.%Y')} ({years} лет {months} мес.)"
     except:
         return reg_date_str
-
 def get_company_status(data: dict) -> tuple[str, str]:
     status = str(data.get('Статус', {}).get('Наим') or data.get('status_text') or data.get('status') or "Действует").lower()
     if any(word in status for word in ["ликвидац", "прекращ", "ликвидирован"]):
@@ -564,7 +651,6 @@ def get_company_status(data: dict) -> tuple[str, str]:
     if any(word in status for word in ["недейств", "исключен"]):
         return "Недействующий статус", "⚠️"
     return "Действует", "✅"
-
 def get_risk_assessment(data: dict, arbitration_data: dict | None = None):
     """Улучшенная оценка рисков v2.9 — добавлены массовые руководитель и учредители"""
     score = 100
@@ -617,12 +703,10 @@ def get_risk_assessment(data: dict, arbitration_data: dict | None = None):
     color = colors.green if score > 75 else colors.orange if score > 45 else colors.red
     recommendation = "✅ Рекомендуется к работе" if score > 80 else "🟡 Требует дополнительной проверки" if score >= 60 else "🚫 Высокий риск!"
     return score, risk_factors, warnings, color, recommendation, arbitration_data, mass_flags
-
 def is_individual_entrepreneur(data: dict) -> bool:
     name = (data.get("НаимПолн") or data.get("full_name") or "").lower()
     ogrn = data.get("ОГРН") or data.get("ОГРНИП") or ""
     return "индивидуальный предприниматель" in name or name.startswith("ип ") or len(str(ogrn)) == 15
-
 def safe_get_director(data: dict) -> str:
     ruk = data.get("Руковод")
     if isinstance(ruk, list) and ruk:
@@ -630,19 +714,16 @@ def safe_get_director(data: dict) -> str:
     if isinstance(ruk, dict):
         return ruk.get("ФИО") or ruk.get("Наим") or "Н/Д"
     return "Н/Д"
-
 def safe_get_branches(data: dict) -> int:
     fil = data.get("Филиалы")
     if isinstance(fil, list):
         return len(fil)
     return 0
-
 def safe_get_founders_count(data: dict) -> int:
     uch = data.get("Учред", {}) or {}
     fl = len(uch.get("ФЛ", [])) if isinstance(uch.get("ФЛ"), list) else 0
     org = len(uch.get("РосОрг", [])) if isinstance(uch.get("РосОрг"), list) else 0
     return fl + org
-
 def safe_get_okved(data: dict) -> str:
     okved = data.get("ОКВЭД") or data.get("okved") or {}
     if isinstance(okved, dict):
@@ -650,7 +731,6 @@ def safe_get_okved(data: dict) -> str:
         name = okved.get("Наим") or okved.get("name") or ""
         return f"{code} — {name}"
     return str(okved) or "Н/Д"
-
 def get_arbitration_cases_table(arbitration_data: dict | None) -> list:
     if not arbitration_data or not isinstance(arbitration_data, dict):
         return []
@@ -666,7 +746,6 @@ def get_arbitration_cases_table(arbitration_data: dict | None) -> list:
         status = case.get("Статус") or case.get("status") or "—"
         table.append([date_str, amount, plaintiff, defendant, status])
     return table
-
 # ================= GRAPH HELPERS FOR PDF (TOP-3) =================
 def draw_score_trend(c, x, y, history):
     """Простой бар + линия график динамики индекса (чисто reportlab, без доп. библиотек)"""
@@ -676,7 +755,7 @@ def draw_score_trend(c, x, y, history):
         c.drawString(x, y - 15, "История пока недостаточна для графика")
         return y - 45
     # history приходит newest-first → разворачиваем для графика (oldest left)
-    history = history[::-1][-10:]  # максимум 10 точек
+    history = history[::-1][-10:] # максимум 10 точек
     n = len(history)
     max_h = 140
     bar_w = 28
@@ -690,8 +769,8 @@ def draw_score_trend(c, x, y, history):
     # Оси
     c.setStrokeColor(colors.grey)
     c.setLineWidth(1)
-    c.line(x, y - max_h, x, y)                    # Y
-    c.line(x, y - max_h, x + chart_w + 20, y - max_h)  # X
+    c.line(x, y - max_h, x, y) # Y
+    c.line(x, y - max_h, x + chart_w + 20, y - max_h) # X
     # Метки Y
     c.setFont(FONT_NAME, 8)
     for val in [0, 50, 100]:
@@ -725,7 +804,6 @@ def draw_score_trend(c, x, y, history):
         prev_x = curr_x
         prev_yy = curr_yy
     return y - max_h - 50
-
 # ================= PREMIUM PDF (улучшенный дизайн v2.9 + TOP-3 графики) =================
 def draw_multiline(c, x, y, text, font_size=10, max_width=480, line_height=14):
     if not text:
@@ -743,7 +821,6 @@ def draw_multiline(c, x, y, text, font_size=10, max_width=480, line_height=14):
         c.drawString(x, y, line)
         y -= line_height
     return y
-
 def create_pro_pdf(data: dict, score: int, risks: list, warnings: list, color: colors,
                    recommendation: str, arbitration_data: dict | None, mass_flags: list,
                    is_premium: bool, cache_time: str | None = None, ai_summary: str | None = None,
@@ -847,7 +924,6 @@ def create_pro_pdf(data: dict, score: int, risks: list, warnings: list, color: c
     table.wrapOn(c, 45, y)
     table.drawOn(c, 45, y - table._height)
     y -= table._height + 35
-
     # НОВОЕ: График истории + таймлайн (TOP-3)
     if history and len(history) > 0:
         c.setFont(FONT_NAME, 13)
@@ -873,7 +949,6 @@ def create_pro_pdf(data: dict, score: int, risks: list, warnings: list, color: c
             tl_table.wrapOn(c, 45, y)
             tl_table.drawOn(c, 45, y - tl_table._height)
             y -= tl_table._height + 25
-
     # Контакты
     contacts = data.get("Контакты") or []
     if isinstance(contacts, dict):
@@ -1014,7 +1089,64 @@ def create_pro_pdf(data: dict, score: int, risks: list, warnings: list, color: c
     c.save()
     buffer.seek(0)
     return buffer
-
+# ================= ENTERPRISE PDF (Platypus + Financial + Altman) =================
+def create_enterprise_pdf(data: dict, score: int, risks: list, fin_analysis: dict, ai_summary: str, is_premium: bool):
+    """Новый профессиональный Enterprise PDF (Platypus) с финансовым анализом и AI Executive Summary"""
+    buffer = BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=A4, rightMargin=30, leftMargin=30, topMargin=30, bottomMargin=18)
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle('Title', fontName=FONT_NAME, fontSize=24, textColor=colors.HexColor("#0a1f44"), spaceAfter=20)
+    h2_style = ParagraphStyle('H2', fontName=FONT_NAME, fontSize=16, textColor=colors.HexColor("#1565c0"), spaceAfter=10, spaceBefore=20)
+    normal_style = ParagraphStyle('Normal', fontName=FONT_NAME, fontSize=11, spaceAfter=8)
+    elements = []
+    elements.append(Paragraph("OSINT PRO ENTERPRISE", title_style))
+    full_name = data.get('НаимПолн') or data.get('full_name') or "Н/Д"
+    elements.append(Paragraph(f"Аналитический отчёт: {full_name}", h2_style))
+    elements.append(Paragraph(f"ИНН: {data.get('ИНН', '—')} | ОГРН: {data.get('ОГРН', '—')}", normal_style))
+    elements.append(Spacer(1, 30))
+    bg_color = colors.green if score > 75 else colors.orange if score > 45 else colors.red
+    score_table = Table([[f"ИНДЕКС НАДЁЖНОСТИ: {score}/100"]], colWidths=[500], rowHeights=[50])
+    score_table.setStyle(TableStyle([('BACKGROUND', (0,0), (-1,-1), bg_color),
+                                     ('TEXTCOLOR', (0,0), (-1,-1), colors.white),
+                                     ('ALIGN', (0,0), (-1,-1), 'CENTER'),
+                                     ('FONTNAME', (0,0), (-1,-1), FONT_NAME),
+                                     ('FONTSIZE', (0,0), (-1,-1), 18),
+                                     ('CORNER_RADIUS', (0,0), (-1,-1), 8)]))
+    elements.append(score_table)
+    elements.append(Spacer(1, 20))
+    if ai_summary:
+        elements.append(Paragraph("🤖 AI Compliance Executive Summary", h2_style))
+        elements.append(Paragraph(ai_summary.replace('\n', '<br/>'), normal_style))
+        elements.append(Spacer(1, 15))
+    elements.append(Paragraph("📊 Финансовый анализ и скоринг", h2_style))
+    fin_data = [
+        ["Показатель", "Значение"],
+        ["Z-счёт Альтмана", str(fin_analysis.get('z_score', 'Н/Д'))],
+        ["Статус риска банкротства", fin_analysis.get('status', 'Н/Д')],
+        ["Рентабельность продаж (ROS)", f"{fin_analysis.get('ros', 0)}%"],
+        ["Коэффициент автономии", str(fin_analysis.get('autonomy', 'Н/Д'))]
+    ]
+    fin_table = Table(fin_data, colWidths=[300, 200])
+    fin_table.setStyle(TableStyle([('BACKGROUND', (0,0), (-1,0), colors.HexColor("#0a1f44")),
+                                   ('TEXTCOLOR', (0,0), (-1,0), colors.white),
+                                   ('FONTNAME', (0,0), (-1,-1), FONT_NAME),
+                                   ('GRID', (0,0), (-1,-1), 1, colors.lightgrey),
+                                   ('ROWBACKGROUNDS', (0,1), (-1,-1), [colors.white, colors.HexColor("#f8f9fa")])]))
+    elements.append(fin_table)
+    elements.append(Spacer(1, 20))
+    if risks:
+        elements.append(PageBreak())
+        elements.append(Paragraph("⚠️ Критические риски", h2_style))
+        risk_data = [["Риск"]] + [[r] for r in risks]
+        rt = Table(risk_data, colWidths=[500])
+        rt.setStyle(TableStyle([('BACKGROUND', (0,0), (-1,0), colors.HexColor("#d32f2f")),
+                                ('TEXTCOLOR', (0,0), (-1,0), colors.white),
+                                ('FONTNAME', (0,0), (-1,-1), FONT_NAME),
+                                ('GRID', (0,0), (-1,-1), 1, colors.lightgrey)]))
+        elements.append(rt)
+    doc.build(elements)
+    buffer.seek(0)
+    return buffer
 # ================= GOOGLE SHEETS + EXCEL =================
 gc = None
 if GOOGLE_CREDENTIALS and SHEET_ID:
@@ -1026,7 +1158,6 @@ if GOOGLE_CREDENTIALS and SHEET_ID:
         logger.info("✅ Google Sheets подключён")
     except Exception as e:
         logger.error(f"Google Sheets error: {e}")
-
 def log_to_sheet(user_id, inn, score: int):
     if not gc or not SHEET_ID:
         return
@@ -1037,7 +1168,6 @@ def log_to_sheet(user_id, inn, score: int):
         worksheet.append_row([now.strftime("%d.%m.%Y %H:%M:%S"), str(user_id), inn, f"score:{score}", "Бесплатный" if score else "Премиум", now.strftime("%H:%M:%S")])
     except Exception as e:
         logger.error(f"Sheet write error: {e}")
-
 async def export_stats_to_excel() -> BytesIO:
     async with aiosqlite.connect(DB_NAME) as db:
         async with db.execute("SELECT * FROM usage_log ORDER BY query_date DESC") as cur:
@@ -1052,7 +1182,6 @@ async def export_stats_to_excel() -> BytesIO:
         sub_df.to_excel(writer, sheet_name="Подписки", index=False)
     buffer.seek(0)
     return buffer
-
 # ================= MASS CHECK (с прогресс-баром) =================
 async def handle_mass_check_document(message: Message):
     document = message.document
@@ -1141,7 +1270,6 @@ async def handle_mass_check_document(message: Message):
         BufferedInputFile(excel_buffer.read(), filename=f"OSINT_PRO_mass_check_{datetime.now().strftime('%Y-%m-%d_%H-%M')}.xlsx"),
         caption=summary
     )
-
 # ================= HANDLERS =================
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
@@ -1162,7 +1290,6 @@ async def cmd_start(message: Message):
         [InlineKeyboardButton(text="👤 Мой профиль", callback_data="profile")]
     ])
     await message.answer(text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
-
 @dp.message(Command("admin"))
 async def cmd_admin(message: Message):
     if message.from_user.id != ADMIN_CHAT_ID:
@@ -1175,14 +1302,12 @@ async def cmd_admin(message: Message):
         [InlineKeyboardButton(text="🚫 Отозвать подписку", callback_data="admin_revoke")],
     ])
     await message.answer("👑 **Админ-панель OSINT PRO v2.9**", reply_markup=kb)
-
 @dp.callback_query(F.data == "admin_stats")
 async def admin_stats(call: CallbackQuery):
     if call.from_user.id != ADMIN_CHAT_ID: return await call.answer("⛔️ Доступ запрещён.")
     await call.answer()
     stats_text = await get_stats()
     await call.message.edit_text(stats_text, parse_mode=ParseMode.MARKDOWN)
-
 @dp.callback_query(F.data == "admin_export")
 async def admin_export(call: CallbackQuery):
     if call.from_user.id != ADMIN_CHAT_ID: return await call.answer("⛔️ Доступ запрещён.")
@@ -1196,25 +1321,21 @@ async def admin_export(call: CallbackQuery):
     except Exception as e:
         logger.error(f"Export error: {e}")
         await call.message.answer("❌ Ошибка генерации Excel")
-
 @dp.callback_query(F.data == "admin_pricing")
 async def admin_pricing(call: CallbackQuery):
     if call.from_user.id != ADMIN_CHAT_ID: return await call.answer("⛔️ Доступ запрещён.")
     await call.answer()
     await call.message.edit_text(f"💰 **Текущая цена подписки**\n\n{SUBSCRIPTION_PRICE}\n\nБезлимит + премиум-PDF + AI + мониторинг")
-
 @dp.callback_query(F.data == "admin_grant")
 async def admin_grant_start(call: CallbackQuery):
     if call.from_user.id != ADMIN_CHAT_ID: return await call.answer("⛔️ Доступ запрещён.")
     await call.answer()
     await call.message.edit_text("🔑 Отправь мне сообщение в формате:\n/grant <user_id> <дней>")
-
 @dp.callback_query(F.data == "admin_revoke")
 async def admin_revoke_start(call: CallbackQuery):
     if call.from_user.id != ADMIN_CHAT_ID: return await call.answer("⛔️ Доступ запрещён.")
     await call.answer()
     await call.message.edit_text("🚫 Отправь мне сообщение в формате:\n/revoke <user_id>")
-
 @dp.message(F.text & ~F.text.startswith("/"))
 async def handle_search(message: Message):
     text = message.text.strip()
@@ -1286,7 +1407,6 @@ async def handle_search(message: Message):
                 callback_data=f"select_{inn_found}"
             )])
     await wait.edit_text(f"✅ Найдено {len(results)} совпадений.\nВыберите компанию:", reply_markup=kb)
-
 @dp.callback_query(F.data.startswith("select_"))
 async def handle_select(call: CallbackQuery):
     inn = call.data.split("_", 1)[1]
@@ -1299,47 +1419,39 @@ async def handle_select(call: CallbackQuery):
         data, arbitration_data, cache_time = await get_company_data(inn)
         if not data:
             return await call.message.answer("❌ Данные не найдены.")
-        score, risks, warnings, color, recommendation, arbitration_data, mass_flags = get_risk_assessment(data, arbitration_data)
-        ai_summary = await get_ai_summary(data, score, risks, recommendation, arbitration_data)
+        # === ИНТЕГРАЦИЯ ENTERPRISE PDF ===
+        score, risks, fin_analysis, color, rec = await get_advanced_risk_assessment(data, arbitration_data)
+        ai_summary = await get_ai_executive_summary(data, score, risks, fin_analysis)
         await log_usage(call.from_user.id, inn, score, is_premium)
         log_to_sheet(call.from_user.id, inn, score)
-        history = await get_company_history(inn)
-        pdf_buffer = create_pro_pdf(
-            data, score, risks, warnings, color, recommendation,
-            arbitration_data, mass_flags, is_premium, cache_time, ai_summary, history
-        )
+        pdf_buffer = create_enterprise_pdf(data, score, risks, fin_analysis, ai_summary, is_premium)
         await call.message.answer_document(
-            BufferedInputFile(pdf_buffer.read(), filename=f"OSINT_PRO_{inn}_v{VERSION}.pdf"),
-            caption="✅ Подробный профессиональный отчёт OSINT PRO v{VERSION}"
+            BufferedInputFile(pdf_buffer.read(), filename=f"OSINT_PRO_{inn}_ENTERPRISE_v{VERSION}.pdf"),
+            caption="✅ Enterprise аналитический отчёт OSINT PRO v{VERSION}"
         )
     except Exception as e:
         logger.error(f"Select error: {e}")
         await call.message.answer("❌ Ошибка открытия отчёта.")
-
 @dp.callback_query(F.data.startswith("pdf_"))
 async def send_pdf(call: CallbackQuery):
     inn = call.data.split("_", 1)[1]
-    await call.answer("Генерирую PDF...")
+    await call.answer("Генерирую Enterprise PDF...")
     try:
         data, arbitration_data, cache_time = await get_company_data(inn)
         if not data:
             raise ValueError("Нет данных")
         is_premium = await is_subscribed(call.from_user.id)
-        score, risks, warnings, color, recommendation, arbitration_data, mass_flags = get_risk_assessment(data, arbitration_data)
-        ai_summary = await get_ai_summary(data, score, risks, recommendation, arbitration_data)
-        history = await get_company_history(inn)
-        pdf_buffer = create_pro_pdf(
-            data, score, risks, warnings, color, recommendation,
-            arbitration_data, mass_flags, is_premium, cache_time, ai_summary, history
-        )
+        # === ИНТЕГРАЦИЯ ENTERPRISE PDF ===
+        score, risks, fin_analysis, color, rec = await get_advanced_risk_assessment(data, arbitration_data)
+        ai_summary = await get_ai_executive_summary(data, score, risks, fin_analysis)
+        pdf_buffer = create_enterprise_pdf(data, score, risks, fin_analysis, ai_summary, is_premium)
         await call.message.answer_document(
-            BufferedInputFile(pdf_buffer.read(), filename=f"OSINT_PRO_{inn}_v{VERSION}.pdf"),
-            caption="✅ Подробный профессиональный отчёт OSINT PRO v{VERSION}"
+            BufferedInputFile(pdf_buffer.read(), filename=f"OSINT_PRO_{inn}_ENTERPRISE_v{VERSION}.pdf"),
+            caption="✅ Enterprise аналитический отчёт OSINT PRO v{VERSION}"
         )
     except Exception as e:
         logger.error(f"PDF error INN {inn}", exc_info=True)
         await call.message.answer("❌ Не удалось сгенерировать PDF.")
-
 @dp.callback_query(F.data.startswith("refresh_"))
 async def handle_refresh(call: CallbackQuery):
     inn = call.data.split("_", 1)[1]
@@ -1348,7 +1460,6 @@ async def handle_refresh(call: CallbackQuery):
         await db.execute("DELETE FROM cache WHERE inn = ?", (inn,))
         await db.commit()
     await call.message.answer("✅ **Кэш очищен!** Пришлите ИНН / ОГРН ещё раз.")
-
 @dp.callback_query(F.data.startswith("monitor_add_"))
 async def handle_monitor_add(call: CallbackQuery):
     inn = call.data.split("_", 2)[2]
@@ -1357,22 +1468,18 @@ async def handle_monitor_add(call: CallbackQuery):
         await call.answer("✅ Добавлено в мониторинг!")
     else:
         await call.answer("❌ Не удалось добавить")
-
 @dp.callback_query(F.data.startswith("monitor_remove_"))
 async def handle_monitor_remove(call: CallbackQuery):
     inn = call.data.split("_", 2)[2]
     await remove_from_monitoring(call.from_user.id, inn)
     await call.answer("✅ Убрано из мониторинга")
-
 @dp.message(F.document)
 async def handle_document(message: Message):
     await handle_mass_check_document(message)
-
 @dp.callback_query(F.data == "buy")
 async def buy_subscription(call: CallbackQuery):
     await call.answer()
     await call.message.answer(f"💰 **Подписка OSINT PRO v{VERSION}**\n\nБезлимит + премиум-PDF + AI + мониторинг — {SUBSCRIPTION_PRICE}\n\nПосле оплаты напишите @ваш_логин с чеком.")
-
 @dp.message(Command("history"))
 async def cmd_history(message: Message):
     try:
@@ -1392,7 +1499,6 @@ async def cmd_history(message: Message):
     except Exception as e:
         logger.error(f"History error: {e}")
         await message.answer("❌ Не удалось загрузить историю.")
-
 @dp.message(Command("monitor"))
 async def cmd_monitor(message: Message):
     monitored = await get_user_monitored(message.from_user.id)
@@ -1402,7 +1508,6 @@ async def cmd_monitor(message: Message):
     for inn, name in monitored:
         text += f"• `{inn}` — {name[:60]}...\n"
     await message.answer(text, parse_mode=ParseMode.MARKDOWN)
-
 @dp.message(Command("profile"))
 async def cmd_profile(message: Message):
     subscribed = await is_subscribed(message.from_user.id)
@@ -1421,7 +1526,6 @@ async def cmd_profile(message: Message):
 🔥 Запросов сегодня: {await get_today_queries(message.from_user.id)}
 💎 Хотите безлимит и премиум-PDF? Нажмите /buy"""
     await message.answer(text, parse_mode=ParseMode.MARKDOWN)
-
 async def get_today_queries(user_id: int) -> int:
     try:
         async with aiosqlite.connect(DB_NAME) as db:
@@ -1433,7 +1537,6 @@ async def get_today_queries(user_id: int) -> int:
                 return row[0] if row else 0
     except:
         return 0
-
 @dp.message(Command("grant"))
 async def cmd_grant(message: Message):
     if message.from_user.id != ADMIN_CHAT_ID: return await message.answer("⛔️ Доступ запрещён.")
@@ -1443,7 +1546,6 @@ async def cmd_grant(message: Message):
         await message.answer(f"✅ Подписка выдана пользователю {user_id_str} на {days_str} дней")
     except:
         await message.answer("❌ Формат: /grant <user_id> <дней>")
-
 @dp.message(Command("revoke"))
 async def cmd_revoke(message: Message):
     if message.from_user.id != ADMIN_CHAT_ID: return await message.answer("⛔️ Доступ запрещён.")
@@ -1453,22 +1555,18 @@ async def cmd_revoke(message: Message):
         await message.answer(f"✅ Подписка отозвана у пользователя {user_id_str}")
     except:
         await message.answer("❌ Формат: /revoke <user_id>")
-
 @dp.message(Command("stats"))
 async def cmd_stats(message: Message):
     if message.from_user.id != ADMIN_CHAT_ID: return await message.answer("⛔️ Доступ запрещён.")
     stats_text = await get_stats()
     await message.answer(stats_text, parse_mode=ParseMode.MARKDOWN)
-
 @dp.message(Command("pricing"))
 async def cmd_pricing(message: Message):
     if message.from_user.id != ADMIN_CHAT_ID: return await message.answer("⛔️ Доступ запрещён.")
     await message.answer(f"💰 **Текущая цена подписки**\n\n{SUBSCRIPTION_PRICE}\n\nБезлимит + премиум-PDF + AI + мониторинг")
-
 # ================= WEBHOOK =================
 async def health_handler(request):
     return web.Response(text="OK", status=200)
-
 async def webhook_handler(request):
     try:
         data = await request.json()
@@ -1478,7 +1576,6 @@ async def webhook_handler(request):
     except Exception as e:
         logger.error(f"Webhook error: {e}")
         return web.Response(text="OK", status=200)
-
 async def main():
     await init_db()
     asyncio.create_task(monitoring_scheduler())
@@ -1492,8 +1589,7 @@ async def main():
     await runner.setup()
     site = web.TCPSite(runner, '0.0.0.0', int(os.environ.get("PORT", 10000)))
     await site.start()
-    logger.info("✅ Webhook + мониторинг + AI + премиум-PDF + графики запущены")
+    logger.info("✅ Webhook + мониторинг + AI + Enterprise PDF + Financial Analyzer запущены")
     await asyncio.Event().wait()
-
 if __name__ == "__main__":
     asyncio.run(main())
