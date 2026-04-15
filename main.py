@@ -514,7 +514,6 @@ async def get_advanced_risk_assessment(data: dict, arbitration_data: dict, finan
     # Финансовый анализ
     analyzer = FinancialAnalyzer(finance_data)
     fin_analysis = analyzer.analyze_latest_year()
-    # Исправлено: проверяем наличие данных перед снижением скора (чтобы не штрафовать за отсутствие данных)
     if fin_analysis['z_score'] < 1.1 and fin_analysis['status'] != "Нет финансовых данных":
         score -= 25
         risk_factors.append(f"🚨 Высокий риск банкротства (Z-Altman: {fin_analysis['z_score']})")
@@ -754,30 +753,25 @@ def draw_score_trend(c, x, y, history):
         c.setFillColor(colors.grey)
         c.drawString(x, y - 15, "История пока недостаточна для графика")
         return y - 45
-    # history приходит newest-first → разворачиваем для графика (oldest left)
-    history = history[::-1][-10:] # максимум 10 точек
+    history = history[::-1][-10:]
     n = len(history)
     max_h = 140
     bar_w = 28
     spacing = 45
     chart_w = n * spacing
-    # Заголовок
     c.setFont(FONT_NAME, 12)
     c.setFillColor(colors.HexColor("#0a1f44"))
     c.drawString(x, y + 5, "📈 ДИНАМИКА ИНДЕКСА БЕЗОПАСНОСТИ")
     y -= 25
-    # Оси
     c.setStrokeColor(colors.grey)
     c.setLineWidth(1)
-    c.line(x, y - max_h, x, y) # Y
-    c.line(x, y - max_h, x + chart_w + 20, y - max_h) # X
-    # Метки Y
+    c.line(x, y - max_h, x, y)
+    c.line(x, y - max_h, x + chart_w + 20, y - max_h)
     c.setFont(FONT_NAME, 8)
     for val in [0, 50, 100]:
         yy = y - max_h + (val / 100 * max_h)
         c.drawString(x - 22, yy - 3, str(val))
         c.line(x - 5, yy, x, yy)
-    # Бары + линия
     prev_x = None
     prev_yy = None
     for i, (ts, score, *_) in enumerate(history):
@@ -786,15 +780,12 @@ def draw_score_trend(c, x, y, history):
         bar_color = colors.HexColor("#00c853") if score > 75 else colors.HexColor("#ffa726") if score > 45 else colors.HexColor("#ef5350")
         c.setFillColor(bar_color)
         c.rect(bar_x, y - max_h, bar_w, bar_h, fill=1, stroke=1)
-        # Значение
         c.setFillColor(colors.black)
         c.setFont(FONT_NAME, 9)
         c.drawString(bar_x + 8, y - max_h + bar_h + 5, str(score))
-        # Дата
         short_date = ts[5:10].replace('-', '.')
         c.setFont(FONT_NAME, 7)
         c.drawString(bar_x + 6, y - max_h - 18, short_date)
-        # Соединительная линия
         curr_x = bar_x + bar_w / 2
         curr_yy = y - max_h + bar_h
         if prev_x is not None:
@@ -829,7 +820,6 @@ def create_pro_pdf(data: dict, score: int, risks: list, warnings: list, color: c
     buffer = BytesIO()
     c = canvas.Canvas(buffer, pagesize=A4)
     y = 800
-    # Header
     c.setFillColor(colors.HexColor("#0a1f44"))
     c.rect(0, y + 10, 595, 70, fill=1, stroke=0)
     c.setFillColor(colors.white)
@@ -854,7 +844,6 @@ def create_pro_pdf(data: dict, score: int, risks: list, warnings: list, color: c
     c.setFont(FONT_NAME, 14)
     c.setFillColor(colors.HexColor("#0a1f44"))
     c.drawString(45, y, "ИНДЕКС БЕЗОПАСНОСТИ")
-    # Progress bar
     bar_width = 280
     bar_height = 28
     c.setStrokeColor(colors.lightgrey)
@@ -874,7 +863,6 @@ def create_pro_pdf(data: dict, score: int, risks: list, warnings: list, color: c
     c.setFont(FONT_NAME, 11)
     c.drawString(360, y - 55, risk_label)
     y -= 85
-    # Ключевые факты
     c.setFont(FONT_NAME, 13)
     c.setFillColor(colors.HexColor("#0a1f44"))
     c.drawString(45, y, "КЛЮЧЕВЫЕ ФАКТЫ")
@@ -924,14 +912,12 @@ def create_pro_pdf(data: dict, score: int, risks: list, warnings: list, color: c
     table.wrapOn(c, 45, y)
     table.drawOn(c, 45, y - table._height)
     y -= table._height + 35
-    # НОВОЕ: График истории + таймлайн (TOP-3)
     if history and len(history) > 0:
         c.setFont(FONT_NAME, 13)
         c.setFillColor(colors.HexColor("#0a1f44"))
         c.drawString(45, y, "📈 ДИНАМИКА И ИСТОРИЯ КОМПАНИИ")
         y -= 35
         y = draw_score_trend(c, 45, y, history)
-        # Таймлайн (последние записи)
         timeline_data = [["Дата", "Индекс", "Арбитраж", "Статус"]]
         for ts, sc, arb, st, _ in history[:5]:
             date_str = datetime.fromisoformat(ts.replace("Z", "+00:00")).strftime("%d.%m")
@@ -949,7 +935,6 @@ def create_pro_pdf(data: dict, score: int, risks: list, warnings: list, color: c
             tl_table.wrapOn(c, 45, y)
             tl_table.drawOn(c, 45, y - tl_table._height)
             y -= tl_table._height + 25
-    # Контакты
     contacts = data.get("Контакты") or []
     if isinstance(contacts, dict):
         flat = []
@@ -983,7 +968,6 @@ def create_pro_pdf(data: dict, score: int, risks: list, warnings: list, color: c
         ct.wrapOn(c, 45, y)
         ct.drawOn(c, 45, y - ct._height)
         y -= ct._height + 30
-    # Учредители
     uchred = data.get("Учред", {})
     if uchred and uchred.get("ФЛ"):
         c.setFont(FONT_NAME, 13)
@@ -1004,7 +988,6 @@ def create_pro_pdf(data: dict, score: int, risks: list, warnings: list, color: c
         ft.wrapOn(c, 45, y)
         ft.drawOn(c, 45, y - ft._height)
         y -= ft._height + 30
-    # Риски
     all_risks = warnings + mass_flags + risks
     if all_risks:
         c.setFont(FONT_NAME, 13)
@@ -1026,7 +1009,6 @@ def create_pro_pdf(data: dict, score: int, risks: list, warnings: list, color: c
         rt.wrapOn(c, 45, y)
         rt.drawOn(c, 45, y - rt._height)
         y -= rt._height + 30
-    # Арбитраж
     arb_table_data = get_arbitration_cases_table(arbitration_data)
     if len(arb_table_data) > 1:
         c.setFont(FONT_NAME, 13)
@@ -1046,7 +1028,6 @@ def create_pro_pdf(data: dict, score: int, risks: list, warnings: list, color: c
         arb_table.wrapOn(c, 45, y)
         arb_table.drawOn(c, 45, y - arb_table._height)
         y -= arb_table._height + 30
-    # AI-анализ в PDF
     if ai_summary:
         c.setFont(FONT_NAME, 13)
         c.setFillColor(colors.HexColor("#0a1f44"))
@@ -1054,7 +1035,6 @@ def create_pro_pdf(data: dict, score: int, risks: list, warnings: list, color: c
         y -= 25
         y = draw_multiline(c, 45, y, ai_summary, font_size=10, max_width=480, line_height=14)
         y -= 20
-    # Рекомендация
     c.setStrokeColor(color)
     c.setLineWidth(3)
     c.roundRect(45, y - 75, 500, 85, 12, stroke=1, fill=0)
@@ -1064,7 +1044,6 @@ def create_pro_pdf(data: dict, score: int, risks: list, warnings: list, color: c
     c.setFillColor(colors.black)
     c.setFont(FONT_NAME, 11)
     y = draw_multiline(c, 65, y - 45, recommendation, font_size=11, max_width=460, line_height=16)
-    # Footer
     c.setFont(FONT_NAME, 8)
     c.setFillColor(colors.grey)
     footer = f"OSINT PRO v{VERSION} • Конфиденциально • Данные на {datetime.now().strftime('%d.%m.%Y %H:%M')}"
@@ -1076,7 +1055,6 @@ def create_pro_pdf(data: dict, score: int, risks: list, warnings: list, color: c
             pass
     c.drawString(45, 35, footer)
     c.drawString(380, 35, "Для внутренних целей • Не для перепродажи")
-    # Водяной знак PREMIUM
     if is_premium:
         c.saveState()
         c.setFillColor(colors.HexColor("#00c853"))
@@ -1147,6 +1125,35 @@ def create_enterprise_pdf(data: dict, score: int, risks: list, fin_analysis: dic
     doc.build(elements)
     buffer.seek(0)
     return buffer
+# ================= ASYNC WRAPPERS ДЛЯ НЕ-БЛОКИРУЮЩЕЙ ГЕНЕРАЦИИ PDF И EXCEL =================
+async def generate_enterprise_pdf_async(data: dict, score: int, risks: list, fin_analysis: dict, ai_summary: str, is_premium: bool) -> BytesIO:
+    """КРИТИЧЕСКИ ВАЖНАЯ АСИНХРОННАЯ ОБЁРТКА:
+    Запускает тяжёлую синхронную генерацию PDF (reportlab + Platypus) в отдельном потоке,
+    чтобы НЕ БЛОКИРОВАТЬ Event Loop aiogram."""
+    def _sync_pdf():
+        return create_enterprise_pdf(data, score, risks, fin_analysis, ai_summary, is_premium)
+    try:
+        return await asyncio.to_thread(_sync_pdf)
+    except Exception as e:
+        logger.error(f"Enterprise PDF generation error in thread: {e}", exc_info=True)
+        raise
+
+async def generate_mass_excel_async(results: list) -> BytesIO:
+    """КРИТИЧЕСКИ ВАЖНАЯ АСИНХРОННАЯ ОБЁРТКА:
+    Запускает pandas + ExcelWriter в отдельном потоке,
+    чтобы массовая проверка 100+ компаний не блокировала бот."""
+    def _sync_excel():
+        result_df = pd.DataFrame(results)
+        excel_buffer = BytesIO()
+        with pd.ExcelWriter(excel_buffer, engine='openpyxl') as writer:
+            result_df.to_excel(writer, sheet_name="OSINT PRO — Массовый отчёт", index=False)
+        excel_buffer.seek(0)
+        return excel_buffer
+    try:
+        return await asyncio.to_thread(_sync_excel)
+    except Exception as e:
+        logger.error(f"Mass Excel generation error in thread: {e}", exc_info=True)
+        raise
 # ================= GOOGLE SHEETS + EXCEL =================
 gc = None
 if GOOGLE_CREDENTIALS and SHEET_ID:
@@ -1208,7 +1215,6 @@ async def handle_mass_check_document(message: Message):
     except Exception:
         await wait_msg.edit_text("❌ Не удалось прочитать файл.")
         return
-    # Поиск колонки с ИНН
     inn_col = None
     for col in df.columns:
         col_str = str(col).lower()
@@ -1254,11 +1260,8 @@ async def handle_mass_check_document(message: Message):
             "Руководитель": safe_get_director(data),
             "Дата регистрации": calculate_age(data.get('ДатаРег', ''))
         })
-    result_df = pd.DataFrame(results)
-    excel_buffer = BytesIO()
-    with pd.ExcelWriter(excel_buffer, engine='openpyxl') as writer:
-        result_df.to_excel(writer, sheet_name="OSINT PRO — Массовый отчёт", index=False)
-    excel_buffer.seek(0)
+    # === НЕ БЛОКИРУЕМ EVENT LOOP ===
+    excel_buffer = await generate_mass_excel_async(results)
     total = len(results)
     risky = len([r for r in results if r["Индекс безопасности"] < 60])
     summary = (f"✅ **Массовый отчёт OSINT PRO v{VERSION} готов!**\n\n"
@@ -1352,7 +1355,6 @@ async def handle_search(message: Message):
         score, risks, warnings, color, recommendation, arbitration_data, mass_flags = get_risk_assessment(data, arbitration_data)
         await log_usage(message.from_user.id, inn, score, is_premium)
         log_to_sheet(message.from_user.id, inn, score)
-        # НОВОЕ: сохраняем историю для графиков в PDF
         arb_count_hist = 0
         if arbitration_data and isinstance(arbitration_data, dict):
             arb_count_hist = arbitration_data.get("total", 0) or len(arbitration_data.get("cases", []))
@@ -1392,7 +1394,6 @@ async def handle_search(message: Message):
         await wait.delete()
         await message.answer(res, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
         return
-    # Поиск по названию
     wait = await message.answer("🔎 Ищу компании по названию...")
     results = await search_by_name(text)
     if not results:
@@ -1419,12 +1420,12 @@ async def handle_select(call: CallbackQuery):
         data, arbitration_data, cache_time = await get_company_data(inn)
         if not data:
             return await call.message.answer("❌ Данные не найдены.")
-        # === ИНТЕГРАЦИЯ ENTERPRISE PDF ===
         score, risks, fin_analysis, color, rec = await get_advanced_risk_assessment(data, arbitration_data)
         ai_summary = await get_ai_executive_summary(data, score, risks, fin_analysis)
         await log_usage(call.from_user.id, inn, score, is_premium)
         log_to_sheet(call.from_user.id, inn, score)
-        pdf_buffer = create_enterprise_pdf(data, score, risks, fin_analysis, ai_summary, is_premium)
+        # === НЕ БЛОКИРУЕМ EVENT LOOP ===
+        pdf_buffer = await generate_enterprise_pdf_async(data, score, risks, fin_analysis, ai_summary, is_premium)
         await call.message.answer_document(
             BufferedInputFile(pdf_buffer.read(), filename=f"OSINT_PRO_{inn}_ENTERPRISE_v{VERSION}.pdf"),
             caption="✅ Enterprise аналитический отчёт OSINT PRO v{VERSION}"
@@ -1441,10 +1442,10 @@ async def send_pdf(call: CallbackQuery):
         if not data:
             raise ValueError("Нет данных")
         is_premium = await is_subscribed(call.from_user.id)
-        # === ИНТЕГРАЦИЯ ENTERPRISE PDF ===
         score, risks, fin_analysis, color, rec = await get_advanced_risk_assessment(data, arbitration_data)
         ai_summary = await get_ai_executive_summary(data, score, risks, fin_analysis)
-        pdf_buffer = create_enterprise_pdf(data, score, risks, fin_analysis, ai_summary, is_premium)
+        # === НЕ БЛОКИРУЕМ EVENT LOOP ===
+        pdf_buffer = await generate_enterprise_pdf_async(data, score, risks, fin_analysis, ai_summary, is_premium)
         await call.message.answer_document(
             BufferedInputFile(pdf_buffer.read(), filename=f"OSINT_PRO_{inn}_ENTERPRISE_v{VERSION}.pdf"),
             caption="✅ Enterprise аналитический отчёт OSINT PRO v{VERSION}"
@@ -1581,7 +1582,7 @@ async def main():
     asyncio.create_task(monitoring_scheduler())
     await bot.delete_webhook(drop_pending_updates=True)
     await bot.set_webhook(url=WEBHOOK_URL)
-    logger.info(f"🚀 OSINT PRO v{VERSION} запущен — премиум-продукт готов к монетизации!")
+    logger.info(f"🚀 OSINT PRO v{VERSION} запущен — Event Loop защищён от блокировок (to_thread для PDF + Excel)!")
     app = web.Application()
     app.router.add_get("/", health_handler)
     app.router.add_post("/webhook", webhook_handler)
@@ -1589,7 +1590,7 @@ async def main():
     await runner.setup()
     site = web.TCPSite(runner, '0.0.0.0', int(os.environ.get("PORT", 10000)))
     await site.start()
-    logger.info("✅ Webhook + мониторинг + AI + Enterprise PDF + Financial Analyzer запущены")
+    logger.info("✅ Webhook + мониторинг + AI + Enterprise PDF + Financial Analyzer + НЕ-БЛОКИРУЮЩИЕ ОПЕРАЦИИ запущены")
     await asyncio.Event().wait()
 if __name__ == "__main__":
     asyncio.run(main())
